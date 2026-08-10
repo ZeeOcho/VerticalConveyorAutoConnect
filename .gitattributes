@@ -1,0 +1,11 @@
+* text=auto
+*.h text eol=lf
+*.cpp text eol=lf
+*.cs text eol=lf
+*.ini text eol=lf
+*.json text eol=lf
+*.uplugin text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.sbp binary
+*.sbpcfg binary
