@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented here.
 
+## [1.0.1] - 2026-08-15
+
+### Changed
+
+- Attachment ↔ attachment candidates now use the real Conveyor Lift hologram's
+  runtime connection capability instead of being rejected categorically.
+- Compatible placement extensions such as `VerticalLogisticsQoL` can therefore
+  enable attachment ↔ attachment blueprint bridges without a hard dependency;
+  vanilla-only behavior remains fail-closed.
+- Pre-`BeginPlay` direction restoration now handles a blueprint-owned attachment
+  in either lift placement slot.
+- Initial target discovery now searches complete vertical endpoint columns,
+  eliminating blueprint-bound-dependent reach while leaving length validity to
+  the real vanilla Conveyor Lift hologram.
+- Vertical connection states now drive the vanilla blueprint automatic-link
+  representation and reset it when a candidate is lost.
+
 ## [1.0.0] - 2026-08-09
 
 Initial public release.
