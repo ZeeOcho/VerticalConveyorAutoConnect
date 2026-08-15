@@ -672,10 +672,6 @@ FBlueprintVerticalConveyorConnectionManager::
 	// preview components, not necessarily the original BlueprintWorld component.
 	// Reuse the duplicate already created by AFGBlueprintHologram so the standard
 	// automatic-link icon can replace the correct direction indicator.
-	if (hologram->mConnectionRepresentationMeshes.Contains(physicalConnection))
-	{
-		return physicalConnection;
-	}
 	UFGFactoryConnectionComponent* fallbackDuplicate = nullptr;
 	for (const auto& pair : hologram->mDuplicateConnectionToOriginalMap)
 	{
@@ -920,8 +916,12 @@ bool FBlueprintVerticalConveyorConnectionManager::
 
 	UFGFactoryConnectionComponent* liftConnection =
 		bridge->mConnectionComponents[1].Get();
-	UFGFactoryConnectionComponent* attachmentConnection =
+	UFGFactoryConnectionComponent* directAttachmentConnection =
 		GetDirectEndpointConnection(placementEnd);
+	UFGFactoryConnectionComponent* attachmentConnection =
+		placementEnd.UsesBlueprintPreviewTransform
+			? GetBlueprintRepresentationConnection(placementEnd)
+			: directAttachmentConnection;
 	if (!IsValid(liftConnection) || !IsValid(attachmentConnection))
 	{
 		return false;
@@ -932,17 +932,50 @@ bool FBlueprintVerticalConveyorConnectionManager::
 	// such as VerticalLogisticsQoL can extend this exact hologram method. Calling
 	// the real method keeps compatibility implicit and fails closed when no such
 	// capability is present.
+	//
+	// Blueprint preview buildables keep their real connection components in
+	// blueprint-local space. Prefer the world-space duplicate that vanilla creates
+	// for connection representation; hidden vertical attachment ports currently do
+	// not receive one. In that fallback case, stage the BlueprintWorld component at
+	// its resolved preview location for this read-only capability call and restore
+	// its authored relative transform immediately afterwards. Making that transient
+	// preview component movable once avoids re-registering it on every hologram tick.
+	//
+	// A synthetic lift hologram also does not move its second connection component
+	// to mTopTransform, so stage and restore that transient component as well.
+	const FTransform liftConnectionRelativeTransform =
+		liftConnection->GetRelativeTransform();
+	const FTransform placementEndWorldTransform =
+		GetEndpointWorldTransform(placementEnd);
+	const bool stageBlueprintAttachment =
+		placementEnd.UsesBlueprintPreviewTransform &&
+		attachmentConnection == directAttachmentConnection;
+	const FTransform attachmentConnectionRelativeTransform =
+		attachmentConnection->GetRelativeTransform();
+	if (liftConnection->GetMobility() != EComponentMobility::Movable)
+	{
+		liftConnection->SetMobility(EComponentMobility::Movable);
+	}
+	if (stageBlueprintAttachment)
+	{
+		if (attachmentConnection->GetMobility() != EComponentMobility::Movable)
+		{
+			attachmentConnection->SetMobility(EComponentMobility::Movable);
+		}
+		attachmentConnection->SetWorldTransform(placementEndWorldTransform);
+	}
+	liftConnection->SetWorldLocation(placementEndWorldTransform.GetLocation());
+
 	const bool canConnect = bridge->CanConnectToConnection(
 		liftConnection,
 		attachmentConnection);
-	UE_LOG(
-		LogVerticalConveyorAutoConnect,
-		VeryVerbose,
-		TEXT("VerticalConveyorAutoConnect: placement-end capability bridge=%s from=%s to=%s accepted=%d"),
-		*GetNameSafe(bridge),
-		*GetNameSafe(liftConnection),
-		*DescribeEndpoint(placementEnd),
-		canConnect ? 1 : 0);
+
+	liftConnection->SetRelativeTransform(liftConnectionRelativeTransform);
+	if (stageBlueprintAttachment)
+	{
+		attachmentConnection->SetRelativeTransform(
+			attachmentConnectionRelativeTransform);
+	}
 	return canConnect;
 }
 
