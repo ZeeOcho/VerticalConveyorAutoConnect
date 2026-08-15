@@ -14,16 +14,29 @@ For each direction, use the physical `Bottom | Upper` endpoint matrix:
 | 3 | Floor Hole | Merger | connect |
 | 4 | Splitter | Floor Hole | connect |
 | 5 | Merger | Floor Hole | connect |
-| 6 | Splitter | Splitter | reject |
-| 7 | Splitter | Merger | reject |
-| 8 | Merger | Splitter | reject |
-| 9 | Merger | Merger | reject |
+| 6 | Splitter | Splitter | reject in vanilla; connect with runtime capability |
+| 7 | Splitter | Merger | reject in vanilla; connect with runtime capability |
+| 8 | Merger | Splitter | reject in vanilla; connect with runtime capability |
+| 9 | Merger | Merger | reject in vanilla; connect with runtime capability |
 
 - `U1-U9`: intended transport direction is upward.
 - `D1-D9`: intended transport direction is downward.
 - `Bottom | Upper` describes physical geometry, not vanilla placement order.
 - Every supported attachment ↔ Floor Hole case starts vanilla placement at the
   attachment.
+
+Run `U6-U9` and `D6-D9` in both capability environments:
+
+- without a lift-placement extension, all eight cases must remain rejected;
+- with a working runtime extension such as `VerticalLogisticsQoL`, all eight
+  cases must preview, construct, and transport items in the intended direction.
+
+The compatibility test is behavioral. `VerticalConveyorAutoConnect` must not
+gain a plugin dependency, installation check, or type reference to the extension.
+Very-verbose logs should show `placement-end capability ... accepted=0` without
+the extension and `accepted=1` with it. This per-candidate trace intentionally
+uses `VeryVerbose` because an unsupported candidate is evaluated every preview
+update.
 
 For mixed supported cases also verify:
 
@@ -71,7 +84,7 @@ Retain coverage for:
 - output ↔ output;
 - already-claimed nearest endpoint;
 - occupied nearest endpoint;
-- unsupported attachment ↔ attachment topology;
+- attachment ↔ attachment when the live lift hologram rejects the second port;
 - incompatible nearest endpoint with a farther valid endpoint.
 
 The invariant is: **never tunnel through the first physical endpoint in the
@@ -88,6 +101,26 @@ R12 should remain a positive soft-clearance parity test.
 
 For machine/belt obstruction cases, compare against an equivalent manually
 placed vanilla Conveyor Lift rather than assuming "obstruction = reject".
+
+## Initial discovery and representation
+
+- **DR1:** place otherwise identical short and tall columns with their open
+  endpoints at different offsets inside the blueprint bounds. Both must begin
+  previewing at the same endpoint-to-endpoint distance.
+- **DR2:** test an unusually long Floor Hole span. It must preview exactly when
+  the configured vanilla Conveyor Lift hologram remains constructible; discovery
+  must not add a second maximum height.
+- **DR3:** confirm a nearer occupied/incompatible endpoint still blocks a farther
+  endpoint found by the supplemental spatial query.
+- **DR4:** after locking, dismantle or unload the target. A later candidate must
+  require a new first click; the old lock must not transfer to it.
+- **UI1:** while a valid vertical bridge is previewed, the source connection's
+  ordinary direction indicator should use vanilla's automatic-link
+  representation; it must return when the target is lost or reset.
+
+Repeat DR2 after any game update that changes manual Conveyor Lift maximum-height
+behaviour. The mod must follow `CanConstruct()` and must not retain an obsolete
+independent length rule.
 
 ## Fixture health
 
@@ -122,6 +155,13 @@ For detailed diagnostics:
 ```ini
 [Core.Log]
 LogVerticalConveyorAutoConnect=Verbose
+```
+
+For per-update capability probes, temporarily use:
+
+```ini
+[Core.Log]
+LogVerticalConveyorAutoConnect=VeryVerbose
 ```
 
 A bug report should include:

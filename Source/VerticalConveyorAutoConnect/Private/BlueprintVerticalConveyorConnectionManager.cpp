@@ -5,6 +5,7 @@
 #include "Buildables/FGBuildableConveyorLift.h"
 #include "Buildables/FGBuildablePassthrough.h"
 #include "Components/SceneComponent.h"
+#include "FGBuildableSubsystem.h"
 #include "FGConstructDisqualifier.h"
 #include "FGFactoryConnectionComponent.h"
 #include "FGRecipe.h"
@@ -90,28 +91,6 @@ bool FBlueprintVerticalConveyorConnectionManager::IsSupportedBuildable(
 {
 	return IsConveyorFloorHole(Cast<AFGBuildablePassthrough>(buildable)) ||
 		IsSupportedAttachment(buildable);
-}
-
-bool FBlueprintVerticalConveyorConnectionManager::IsSupportedBridgeTopology(
-	const FEndpointRef& first,
-	const FEndpointRef& second)
-{
-	const bool firstFloor =
-		first.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide;
-	const bool secondFloor =
-		second.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide;
-	const bool firstAttachment =
-		first.Kind == EBlueprintVerticalEndpointKind::AttachmentPort;
-	const bool secondAttachment =
-		second.Kind == EBlueprintVerticalEndpointKind::AttachmentPort;
-
-	// Vanilla can complete a conveyor-lift placement between two floor holes,
-	// and between one vertical splitter/merger port and one floor hole (when
-	// placement starts at the attachment). It cannot complete attachment-to-
-	// attachment lift placement, so do not synthesize that topology.
-	return (firstFloor && secondFloor) ||
-		(firstAttachment && secondFloor) ||
-		(firstFloor && secondAttachment);
 }
 
 EBlueprintVerticalEndpointSide
@@ -277,6 +256,72 @@ void FBlueprintVerticalConveyorConnectionManager::GatherEndpoints(
 		endpoint.Side = port.Side;
 		endpoint.ConnectionName = port.Name;
 		endpoint.UsesBlueprintPreviewTransform = useBlueprintPreviewTransform;
+	}
+}
+
+void FBlueprintVerticalConveyorConnectionManager::GatherDiscoveryCandidates(
+	TArray<AFGBuildable*>& outBuildables) const
+{
+	outBuildables.Reset();
+
+	TSet<AFGBuildable*> uniqueBuildables;
+	auto addCandidate = [&outBuildables, &uniqueBuildables](
+		AFGBuildable* buildable)
+	{
+		if (IsSupportedBuildable(buildable) &&
+			!uniqueBuildables.Contains(buildable))
+		{
+			uniqueBuildables.Add(buildable);
+			outBuildables.Add(buildable);
+		}
+	};
+
+	// Preserve vanilla's ordinary overlap feed. The complete-column query below
+	// supplements it; it does not replace the parent hologram lifecycle.
+	for (const TWeakObjectPtr<AFGBuildable>& weakBuildable : NearbyBuildables)
+	{
+		addCandidate(weakBuildable.Get());
+	}
+
+	AFGBuildableSubsystem* buildableSubsystem =
+		AFGBuildableSubsystem::Get(GetHologram());
+	if (!IsValid(buildableSubsystem))
+	{
+		return;
+	}
+
+	FBox sourceBounds(ForceInit);
+	bool hasSource = false;
+	for (const FConnectionState& state : ConnectionStates)
+	{
+		const FEndpointRef endpoint = GetBlueprintEndpoint(state, false);
+		if (!IsValid(endpoint.Buildable))
+		{
+			continue;
+		}
+		sourceBounds += GetEndpointWorldTransform(endpoint).GetLocation();
+		hasSource = true;
+	}
+	if (!hasSource)
+	{
+		return;
+	}
+
+	// The parent clearance detector is only vanilla's actor-discovery broadphase;
+	// it is not a semantic connection-distance rule. Query the world-height prism
+	// through all source endpoint columns, then let exact XY matching, no-tunneling
+	// rules, and the real Conveyor Lift hologram decide which candidates are valid.
+	// WORLD_MAX is Unreal's world-coordinate bound, not a mod-defined lift range.
+	FBox queryBounds = sourceBounds;
+	queryBounds.Min.Z = -WORLD_MAX;
+	queryBounds.Max.Z = WORLD_MAX;
+	TArray<AFGBuildable*> spatialCandidates;
+	buildableSubsystem->GetCollidingBuildablesInBoundingBox(
+		spatialCandidates,
+		queryBounds);
+	for (AFGBuildable* buildable : spatialCandidates)
+	{
+		addCandidate(buildable);
 	}
 }
 
@@ -610,6 +655,48 @@ FBlueprintVerticalConveyorConnectionManager::GetTransportConnectionAcrossEndpoin
 	return GetFloorHoleSnappedConnection(hole, OppositeSide(endpoint.Side));
 }
 
+UFGFactoryConnectionComponent*
+FBlueprintVerticalConveyorConnectionManager::
+	GetBlueprintRepresentationConnection(const FEndpointRef& endpoint) const
+{
+	UFGFactoryConnectionComponent* physicalConnection =
+		GetTransportConnectionAcrossEndpoint(endpoint);
+	AFGBlueprintHologram* hologram = GetHologram();
+	if (!IsValid(physicalConnection) || !IsValid(hologram))
+	{
+		return physicalConnection;
+	}
+
+	// Vanilla represents blueprint-world connections with duplicated components
+	// attached to the placed hologram. Its state-change delegate receives those
+	// preview components, not necessarily the original BlueprintWorld component.
+	// Reuse the duplicate already created by AFGBlueprintHologram so the standard
+	// automatic-link icon can replace the correct direction indicator.
+	if (hologram->mConnectionRepresentationMeshes.Contains(physicalConnection))
+	{
+		return physicalConnection;
+	}
+	UFGFactoryConnectionComponent* fallbackDuplicate = nullptr;
+	for (const auto& pair : hologram->mDuplicateConnectionToOriginalMap)
+	{
+		if (pair.Value.Get() == physicalConnection)
+		{
+			if (UFGFactoryConnectionComponent* duplicate =
+				Cast<UFGFactoryConnectionComponent>(pair.Key.Get()))
+			{
+				if (hologram->mConnectionRepresentationMeshes.Contains(duplicate))
+				{
+					return duplicate;
+				}
+				fallbackDuplicate = duplicate;
+			}
+		}
+	}
+	return IsValid(fallbackDuplicate)
+		? fallbackDuplicate
+		: physicalConnection;
+}
+
 AFGBuildableConveyorLift*
 FBlueprintVerticalConveyorConnectionManager::GetAdjacentLift(
 	const FEndpointRef& endpoint) const
@@ -766,22 +853,112 @@ bool FBlueprintVerticalConveyorConnectionManager::
 	return true;
 }
 
-bool FBlueprintVerticalConveyorConnectionManager::ResolveVanillaPlacementEndpoints(
+bool FBlueprintVerticalConveyorConnectionManager::
+	PrepareAttachmentEndpointDirection(
+		const FEndpointRef& attachmentEndpoint,
+		const FEndpointRef& blueprintEndpoint,
+		bool isTransportInput,
+		bool finalValidation,
+		EFactoryConnectionDirection& outDirection) const
+{
+	if (attachmentEndpoint.Kind !=
+		EBlueprintVerticalEndpointKind::AttachmentPort)
+	{
+		return false;
+	}
+
+	// The attachment is outside the generated lift. It must therefore output
+	// into the lift at the transport-input end and accept lift output at the
+	// transport-output end.
+	outDirection = isTransportInput
+		? EFactoryConnectionDirection::FCD_OUTPUT
+		: EFactoryConnectionDirection::FCD_INPUT;
+
+	UFGFactoryConnectionComponent* connection =
+		GetDirectEndpointConnection(attachmentEndpoint);
+	if (!IsValid(connection))
+	{
+		return false;
+	}
+
+	// Final bridge construction precedes BeginPlay on blueprint-owned
+	// attachments. Restore either end of an attachment-to-attachment bridge,
+	// not merely placement slot 0.
+	const bool originatedFromBlueprint =
+		attachmentEndpoint.Buildable == blueprintEndpoint.Buildable;
+	if (finalValidation && originatedFromBlueprint &&
+		!RestorePersistedAttachmentDirectionBeforeConstruct(
+			attachmentEndpoint,
+			outDirection))
+	{
+		return false;
+	}
+
+	const EFactoryConnectionDirection runtimeDirection =
+		connection->GetDirection();
+	return (runtimeDirection != EFactoryConnectionDirection::FCD_INPUT &&
+			runtimeDirection != EFactoryConnectionDirection::FCD_OUTPUT) ||
+		runtimeDirection == outDirection;
+}
+
+bool FBlueprintVerticalConveyorConnectionManager::
+	CanConnectLiftToPlacementEnd(
+		AFGConveyorLiftHologram* bridge,
+		const FEndpointRef& placementEnd) const
+{
+	if (!IsValid(bridge))
+	{
+		return false;
+	}
+
+	if (placementEnd.Kind ==
+		EBlueprintVerticalEndpointKind::FloorHoleSide)
+	{
+		return IsConveyorFloorHole(
+			Cast<AFGBuildablePassthrough>(placementEnd.Buildable));
+	}
+
+	UFGFactoryConnectionComponent* liftConnection =
+		bridge->mConnectionComponents[1].Get();
+	UFGFactoryConnectionComponent* attachmentConnection =
+		GetDirectEndpointConnection(placementEnd);
+	if (!IsValid(liftConnection) || !IsValid(attachmentConnection))
+	{
+		return false;
+	}
+
+	// This call is the runtime capability contract. Vanilla currently rejects a
+	// lift whose second placement endpoint is a vertical attachment port. A mod
+	// such as VerticalLogisticsQoL can extend this exact hologram method. Calling
+	// the real method keeps compatibility implicit and fails closed when no such
+	// capability is present.
+	const bool canConnect = bridge->CanConnectToConnection(
+		liftConnection,
+		attachmentConnection);
+	UE_LOG(
+		LogVerticalConveyorAutoConnect,
+		VeryVerbose,
+		TEXT("VerticalConveyorAutoConnect: placement-end capability bridge=%s from=%s to=%s accepted=%d"),
+		*GetNameSafe(bridge),
+		*GetNameSafe(liftConnection),
+		*DescribeEndpoint(placementEnd),
+		canConnect ? 1 : 0);
+	return canConnect;
+}
+
+bool FBlueprintVerticalConveyorConnectionManager::ResolveLiftPlacementEndpoints(
 	const FEndpointRef& transportInput,
 	const FEndpointRef& transportOutput,
 	FEndpointRef& outPlacementStart,
 	FEndpointRef& outPlacementEnd) const
 {
-	if (!IsSupportedBridgeTopology(transportInput, transportOutput))
-	{
-		return false;
-	}
-
-	// Blueprint ownership and transport direction are deliberately irrelevant
-	// here. Manual vanilla placement establishes that an attachment<->floor-hole
-	// lift must START at the splitter/merger side, even when that attachment is
-	// the world-side target or the transport output. Floor-hole<->floor-hole keeps
-	// the known-working transport-input-first convention.
+	// Blueprint ownership is deliberately irrelevant here. Manual vanilla
+	// placement establishes that an attachment<->floor-hole lift must START at
+	// the splitter/merger side, even when that attachment is the world-side target
+	// or the transport output. For two attachments, start at the transport-input
+	// attachment and let the live lift hologram decide whether it can connect its
+	// second endpoint. Floor-hole<->floor-hole keeps the known-working
+	// transport-input-first convention.
 	if (transportInput.Kind == EBlueprintVerticalEndpointKind::AttachmentPort)
 	{
 		outPlacementStart = transportInput;
@@ -1068,8 +1245,7 @@ bool FBlueprintVerticalConveyorConnectionManager::ConfigureBridgeHologram(
 		GetBlueprintEndpoint(state, useConstructedBlueprintBuildable);
 	const FEndpointRef targetEndpoint = GetTargetEndpoint(state);
 	if (!IsValid(blueprintEndpoint.Buildable) ||
-		!IsValid(targetEndpoint.Buildable) ||
-		!IsSupportedBridgeTopology(blueprintEndpoint, targetEndpoint))
+		!IsValid(targetEndpoint.Buildable))
 	{
 		return false;
 	}
@@ -1127,7 +1303,7 @@ bool FBlueprintVerticalConveyorConnectionManager::ConfigureBridgeHologram(
 
 	FEndpointRef placementStart;
 	FEndpointRef placementEnd;
-	if (!ResolveVanillaPlacementEndpoints(
+	if (!ResolveLiftPlacementEndpoints(
 		inputEndpoint,
 		outputEndpoint,
 		placementStart,
@@ -1165,83 +1341,89 @@ bool FBlueprintVerticalConveyorConnectionManager::ConfigureBridgeHologram(
 	bridge->mTopTransform =
 		placementEndTransform.GetRelativeTransform(placementStartTransform);
 
-	const bool attachmentPlacement =
+	const bool placementStartsAtAttachment =
 		placementStart.Kind == EBlueprintVerticalEndpointKind::AttachmentPort;
+	const bool placementEndsAtAttachment =
+		placementEnd.Kind == EBlueprintVerticalEndpointKind::AttachmentPort;
 	EFactoryConnectionDirection forcedAttachmentDirection =
 		EFactoryConnectionDirection::FCD_ANY;
 	bridge->mSnappedPassthroughs.SetNum(2);
 
-	if (attachmentPlacement)
+	if (placementStartsAtAttachment)
 	{
-		// Measured vanilla state: attachment is placement slot 0 and the floor
-		// hole is slot 1. Flow is expressed by arrow/reversal, not by swapping
-		// those placement slots.
-		AFGBuildablePassthrough* floorHole =
-			Cast<AFGBuildablePassthrough>(placementEnd.Buildable);
-		UFGFactoryConnectionComponent* attachmentConnection =
+		// Measured vanilla state: an attachment is placement slot 0. Slot 1 is
+		// either a Floor Hole or, when the live hologram exposes that capability,
+		// another attachment. Flow is expressed by arrow/reversal, not by swapping
+		// placement slots.
+		UFGFactoryConnectionComponent* startAttachmentConnection =
 			GetDirectEndpointConnection(placementStart);
-		if (!IsValid(floorHole) || !IsValid(attachmentConnection))
+		if (!IsValid(startAttachmentConnection))
 		{
 			return false;
 		}
 
-		const bool attachmentIsTransportInput =
+		const bool startIsTransportInput =
 			MakeEndpointKey(placementStart) == MakeEndpointKey(inputEndpoint);
-		const EFactoryConnectionDirection attachmentDirection =
-			attachmentIsTransportInput
-				? EFactoryConnectionDirection::FCD_OUTPUT
-				: EFactoryConnectionDirection::FCD_INPUT;
-		forcedAttachmentDirection = attachmentDirection;
-
-		// Manual vanilla placement shows that slot-0 attachment direction is
-		// exactly complementary to the lift endpoint at that location. The transport
-		// role was already resolved and locked in preview; final construction may
-		// need to restore the freshly spawned blueprint attachment's persisted role
-		// before vanilla configures the child lift.
-		EFactoryConnectionDirection runtimeAttachmentDirection =
-			attachmentConnection->GetDirection();
-
-		// The freshly spawned blueprint attachment has not received BeginPlay yet.
-		// Its vertical port can therefore still expose ANY or a concrete default/
-		// stale role even though its vanilla role is persisted in mSavedDirections.
-		// The endpoint representation flag is not an ownership flag:
-		// GetBlueprintEndpoint(state, true) intentionally clears UsesBlueprintPreviewTransform because
-		// the constructed actor must use ordinary world transforms. Ownership is
-		// instead determined by identity with blueprintEndpoint.Buildable.
-		// ConfigureActor is sensitive to the snapped component itself, so make that
-		// pre-BeginPlay state match the state vanilla will establish moments later.
-		const bool placementStartOriginatedFromBlueprint =
-			placementStart.Buildable == blueprintEndpoint.Buildable;
-		if (finalValidation && placementStartOriginatedFromBlueprint)
+		if (!PrepareAttachmentEndpointDirection(
+				placementStart,
+				blueprintEndpoint,
+				startIsTransportInput,
+				finalValidation,
+				forcedAttachmentDirection))
 		{
-			if (!RestorePersistedAttachmentDirectionBeforeConstruct(
-					placementStart,
-					attachmentDirection))
+			return false;
+		}
+
+		AFGBuildablePassthrough* floorHole = nullptr;
+		UFGFactoryConnectionComponent* endAttachmentConnection = nullptr;
+		if (placementEndsAtAttachment)
+		{
+			EFactoryConnectionDirection endAttachmentDirection =
+				EFactoryConnectionDirection::FCD_ANY;
+			const bool endIsTransportInput =
+				MakeEndpointKey(placementEnd) == MakeEndpointKey(inputEndpoint);
+			if (!PrepareAttachmentEndpointDirection(
+					placementEnd,
+					blueprintEndpoint,
+					endIsTransportInput,
+					finalValidation,
+					endAttachmentDirection))
 			{
 				return false;
 			}
-			runtimeAttachmentDirection = attachmentConnection->GetDirection();
+			endAttachmentConnection =
+				GetDirectEndpointConnection(placementEnd);
+			if (!IsValid(endAttachmentConnection) ||
+				OppositeDirection(endAttachmentDirection) !=
+					forcedAttachmentDirection)
+			{
+				return false;
+			}
 		}
-
-		if ((runtimeAttachmentDirection == EFactoryConnectionDirection::FCD_INPUT ||
-			 runtimeAttachmentDirection == EFactoryConnectionDirection::FCD_OUTPUT) &&
-			runtimeAttachmentDirection != attachmentDirection)
+		else
 		{
-			return false;
+			floorHole =
+				Cast<AFGBuildablePassthrough>(placementEnd.Buildable);
+			if (!IsConveyorFloorHole(floorHole))
+			{
+				return false;
+			}
 		}
 
 		bridge->mSnappedPassthroughs[0] = nullptr;
 		bridge->mSnappedPassthroughs[1] = floorHole;
-		bridge->mSnappedConnectionComponents[0] = attachmentConnection;
-		// Manual vanilla placement stores the conveyor connection across the
-		// passthrough in slot 1 when one exists. Bare floor holes leave it null.
-		bridge->mSnappedConnectionComponents[1] =
-			GetTransportConnectionAcrossEndpoint(placementEnd);
+		bridge->mSnappedConnectionComponents[0] = startAttachmentConnection;
+		// For a Floor Hole, manual vanilla placement stores the continuation
+		// across the passthrough in slot 1 when one exists. A bare Floor Hole leaves
+		// it null. An attachment endpoint stores its direct vertical connection.
+		bridge->mSnappedConnectionComponents[1] = placementEndsAtAttachment
+			? endAttachmentConnection
+			: GetTransportConnectionAcrossEndpoint(placementEnd);
 		bridge->mForcedNormalDirection =
 			GetEndpointOutwardNormalWorld(placementStart);
-		bridge->mArrowDirection = attachmentDirection;
+		bridge->mArrowDirection = forcedAttachmentDirection;
 		bridge->mIsReversed =
-			attachmentDirection == EFactoryConnectionDirection::FCD_INPUT;
+			forcedAttachmentDirection == EFactoryConnectionDirection::FCD_INPUT;
 		bridge->mFirstStepYaw = 0.0f;
 	}
 	else
@@ -1270,7 +1452,7 @@ bool FBlueprintVerticalConveyorConnectionManager::ConfigureBridgeHologram(
 	bridge->OnRep_TopTransform();
 	bridge->OnRep_SnappedPassthroughs();
 
-	if (attachmentPlacement)
+	if (placementStartsAtAttachment)
 	{
 		// UpdateConnectionDirections() and the transform/passthrough rep callbacks are
 		// designed around a normally snapped interactive placement. With a synthetic
@@ -1297,6 +1479,11 @@ bool FBlueprintVerticalConveyorConnectionManager::ConfigureBridgeHologram(
 		bridge->mArrowDirection = forcedAttachmentDirection;
 		bridge->mIsReversed =
 			forcedAttachmentDirection == EFactoryConnectionDirection::FCD_INPUT;
+	}
+
+	if (!CanConnectLiftToPlacementEnd(bridge, placementEnd))
+	{
+		return false;
 	}
 
 	bridge->OnRep_ArrowDirection();
@@ -1339,7 +1526,7 @@ bool FBlueprintVerticalConveyorConnectionManager::ConfigureBridgeHologram(
 		UE_LOG(
 			LogVerticalConveyorAutoConnect,
 			Verbose,
-			TEXT("VerticalConveyorAutoConnect: final-config %s flow=%s transportInput=%s loc=%s transportOutput=%s loc=%s placementStart=%s placementEnd=%s placementStartIsTransportInput=%d attachmentPlacement=%d reversed=%d arrow=%d own0=%d own1=%d snap0=%s snap1=%s pass0=%s pass1=%s spanZ=%.1f canConstruct=%d disqualifiers=[%s]"),
+			TEXT("VerticalConveyorAutoConnect: final-config %s flow=%s transportInput=%s loc=%s transportOutput=%s loc=%s placementStart=%s placementEnd=%s placementStartIsTransportInput=%d startsAtAttachment=%d endsAtAttachment=%d reversed=%d arrow=%d own0=%d own1=%d snap0=%s snap1=%s pass0=%s pass1=%s spanZ=%.1f canConstruct=%d disqualifiers=[%s]"),
 			*GetNameSafe(bridge),
 			flowsUpwards ? TEXT("up") : TEXT("down"),
 			*DescribeEndpoint(inputEndpoint),
@@ -1349,7 +1536,8 @@ bool FBlueprintVerticalConveyorConnectionManager::ConfigureBridgeHologram(
 			*DescribeEndpoint(placementStart),
 			*DescribeEndpoint(placementEnd),
 			placementStartsAtTransportInput ? 1 : 0,
-			attachmentPlacement ? 1 : 0,
+			placementStartsAtAttachment ? 1 : 0,
+			placementEndsAtAttachment ? 1 : 0,
 			bridge->mIsReversed ? 1 : 0,
 			static_cast<int32>(bridge->mArrowDirection),
 			IsValid(bridge->mConnectionComponents[0].Get())
@@ -1513,11 +1701,19 @@ bool FBlueprintVerticalConveyorConnectionManager::IsGeometricallyCompatible(
 void FBlueprintVerticalConveyorConnectionManager::FindBestTarget(
 	FConnectionState& state,
 	int32 stateIndex,
-	const TSet<FEndpointKey>& claimedTargetEndpoints)
+	const TSet<FEndpointKey>& claimedTargetEndpoints,
+	const TArray<AFGBuildable*>& discoveryBuildables)
 {
 	if (state.HasSnappedTarget && IsValid(state.TargetBuildable))
 	{
 		return;
+	}
+	if (state.HasSnappedTarget)
+	{
+		// Match vanilla's state lifecycle: a destroyed/unloaded locked target
+		// releases the first-click lock instead of silently carrying it to a new
+		// candidate.
+		state.HasSnappedTarget = false;
 	}
 
 	ClearTarget(state);
@@ -1542,9 +1738,8 @@ void FBlueprintVerticalConveyorConnectionManager::FindBestTarget(
 	// column: if the nearest endpoint cannot be used, do not tunnel through it
 	// to a farther endpoint at the same X/Y coordinates.
 	TArray<FPhysicalCandidate> physicalCandidates;
-	for (const TWeakObjectPtr<AFGBuildable>& weakBuildable : NearbyBuildables)
+	for (AFGBuildable* buildable : discoveryBuildables)
 	{
-		AFGBuildable* buildable = weakBuildable.Get();
 		if (!IsValid(buildable))
 		{
 			continue;
@@ -1585,7 +1780,6 @@ void FBlueprintVerticalConveyorConnectionManager::FindBestTarget(
 			{
 				continue;
 			}
-
 			FEndpointRef blockingBlueprintEndpoint;
 			if (!canDirectlyConnect &&
 				HasInterveningBlueprintEndpoint(
@@ -1669,10 +1863,6 @@ void FBlueprintVerticalConveyorConnectionManager::FindBestTarget(
 
 		const FEndpointRef& blueprintEndpoint = physical.BlueprintEndpoint;
 		const FEndpointRef& targetEndpoint = physical.Endpoint;
-		if (!IsSupportedBridgeTopology(blueprintEndpoint, targetEndpoint))
-		{
-			continue;
-		}
 		if (!IsEndpointOpen(targetEndpoint))
 		{
 			continue;
@@ -1753,6 +1943,41 @@ void FBlueprintVerticalConveyorConnectionManager::FindBestTarget(
 	DisableBridge(state);
 }
 
+void FBlueprintVerticalConveyorConnectionManager::
+	BroadcastConnectionStateChange(
+		const FEndpointRef& blueprintEndpoint,
+		const FEndpointRef& previousTargetEndpoint,
+		const FEndpointRef& targetEndpoint,
+		bool isValid)
+{
+	TArray<UFGConnectionComponent*> blueprintConnections;
+	if (UFGFactoryConnectionComponent* connection =
+		GetBlueprintRepresentationConnection(blueprintEndpoint))
+	{
+		blueprintConnections.Add(connection);
+	}
+	if (blueprintConnections.IsEmpty())
+	{
+		// A bare Floor Hole has no factory connection component (and therefore no
+		// ordinary direction indicator) for the parent hologram to replace.
+		return;
+	}
+
+	UFGFactoryConnectionComponent* previousTargetConnection =
+		GetTransportConnectionAcrossEndpoint(previousTargetEndpoint);
+	UFGFactoryConnectionComponent* targetConnection =
+		GetTransportConnectionAcrossEndpoint(targetEndpoint);
+
+	// This is the same delegate contract used by vanilla's manager. The parent
+	// hologram owns the automatic-link representation and swaps the ordinary
+	// connection-direction visualization when a state becomes valid.
+	mOnConnectionStateChanged.Broadcast(
+		blueprintConnections,
+		previousTargetConnection,
+		targetConnection,
+		isValid);
+}
+
 void FBlueprintVerticalConveyorConnectionManager::UpdateAutomaticConnections(
 	const FHitResult& /*hitResult*/,
 	bool& outPlaySnapEffects)
@@ -1763,15 +1988,27 @@ void FBlueprintVerticalConveyorConnectionManager::UpdateAutomaticConnections(
 			return !buildable.IsValid();
 		});
 
+	TArray<AFGBuildable*> discoveryBuildables;
+	GatherDiscoveryCandidates(discoveryBuildables);
+
 	TSet<FEndpointKey> claimedTargetEndpoints;
 	for (int32 stateIndex = 0; stateIndex < ConnectionStates.Num(); ++stateIndex)
 	{
 		FConnectionState& state = ConnectionStates[stateIndex];
 		AFGBuildable* previousTarget = state.TargetBuildable;
 		const FName previousConnectionName = state.TargetConnectionName;
+		const EBlueprintVerticalEndpointKind previousTargetKind =
+			state.TargetKind;
+		const EBlueprintVerticalEndpointSide previousTargetSide =
+			state.TargetSide;
 		const bool previousValid = state.IsValid;
+		const FEndpointRef previousTargetEndpoint = GetTargetEndpoint(state);
 
-		FindBestTarget(state, stateIndex, claimedTargetEndpoints);
+		FindBestTarget(
+			state,
+			stateIndex,
+			claimedTargetEndpoints,
+			discoveryBuildables);
 		if (state.IsValid && IsValid(state.TargetBuildable))
 		{
 			claimedTargetEndpoints.Add(MakeEndpointKey(GetTargetEndpoint(state)));
@@ -1779,8 +2016,15 @@ void FBlueprintVerticalConveyorConnectionManager::UpdateAutomaticConnections(
 
 		if (previousTarget != state.TargetBuildable ||
 			previousConnectionName != state.TargetConnectionName ||
+			previousTargetKind != state.TargetKind ||
+			previousTargetSide != state.TargetSide ||
 			previousValid != state.IsValid)
 		{
+			BroadcastConnectionStateChange(
+				GetBlueprintEndpoint(state, false),
+				previousTargetEndpoint,
+				GetTargetEndpoint(state),
+				state.IsValid);
 			outPlaySnapEffects = outPlaySnapEffects || state.IsValid;
 			UE_LOG(
 				LogVerticalConveyorAutoConnect,
@@ -1843,10 +2087,23 @@ void FBlueprintVerticalConveyorConnectionManager::ResetAutomaticConnections()
 {
 	for (FConnectionState& state : ConnectionStates)
 	{
+		const FEndpointRef blueprintEndpoint =
+			GetBlueprintEndpoint(state, false);
+		const FEndpointRef previousTargetEndpoint = GetTargetEndpoint(state);
+		const bool shouldBroadcast =
+			state.IsValid || IsValid(state.TargetBuildable);
 		ClearTarget(state);
 		state.ConstructedBlueprintBuildable = nullptr;
 		state.HasSnappedTarget = false;
 		DisableBridge(state);
+		if (shouldBroadcast)
+		{
+			BroadcastConnectionStateChange(
+				blueprintEndpoint,
+				previousTargetEndpoint,
+				GetTargetEndpoint(state),
+				false);
+		}
 	}
 }
 

@@ -188,9 +188,6 @@ private:
 		FAttachmentLiftPorts& outPorts);
 	static bool IsSupportedAttachment(const AFGBuildable* buildable);
 	static bool IsSupportedBuildable(const AFGBuildable* buildable);
-	static bool IsSupportedBridgeTopology(
-		const FEndpointRef& first,
-		const FEndpointRef& second);
 	static EBlueprintVerticalEndpointSide OppositeSide(
 		EBlueprintVerticalEndpointSide side);
 	static EFactoryConnectionDirection OppositeDirection(
@@ -211,6 +208,8 @@ private:
 		bool useBlueprintPreviewTransform,
 		bool requireOpen,
 		TArray<FEndpointRef>& outEndpoints) const;
+	void GatherDiscoveryCandidates(
+		TArray<AFGBuildable*>& outBuildables) const;
 	bool IsEndpointOpen(const FEndpointRef& endpoint) const;
 	bool HasInterveningBlueprintEndpoint(
 		const FEndpointRef& sourceEndpoint,
@@ -233,6 +232,8 @@ private:
 		const FEndpointRef& endpoint) const;
 	UFGFactoryConnectionComponent* GetTransportConnectionAcrossEndpoint(
 		const FEndpointRef& endpoint) const;
+	UFGFactoryConnectionComponent* GetBlueprintRepresentationConnection(
+		const FEndpointRef& endpoint) const;
 	AFGBuildableConveyorLift* GetAdjacentLift(
 		const FEndpointRef& endpoint) const;
 	TSubclassOf<UFGRecipe> GetEndpointLiftRecipe(
@@ -243,8 +244,17 @@ private:
 	bool RestorePersistedAttachmentDirectionBeforeConstruct(
 		const FEndpointRef& attachmentEndpoint,
 		EFactoryConnectionDirection expectedDirection) const;
+	bool PrepareAttachmentEndpointDirection(
+		const FEndpointRef& attachmentEndpoint,
+		const FEndpointRef& blueprintEndpoint,
+		bool isTransportInput,
+		bool finalValidation,
+		EFactoryConnectionDirection& outDirection) const;
+	bool CanConnectLiftToPlacementEnd(
+		AFGConveyorLiftHologram* bridge,
+		const FEndpointRef& placementEnd) const;
 
-	bool ResolveVanillaPlacementEndpoints(
+	bool ResolveLiftPlacementEndpoints(
 		const FEndpointRef& transportInput,
 		const FEndpointRef& transportOutput,
 		FEndpointRef& outPlacementStart,
@@ -278,7 +288,13 @@ private:
 	void FindBestTarget(
 		FConnectionState& state,
 		int32 stateIndex,
-		const TSet<FEndpointKey>& claimedTargetEndpoints);
+		const TSet<FEndpointKey>& claimedTargetEndpoints,
+		const TArray<AFGBuildable*>& discoveryBuildables);
+	void BroadcastConnectionStateChange(
+		const FEndpointRef& blueprintEndpoint,
+		const FEndpointRef& previousTargetEndpoint,
+		const FEndpointRef& targetEndpoint,
+		bool isValid);
 	bool IsAttachmentPortForSpan(
 		const FEndpointRef& attachmentEndpoint,
 		const FEndpointRef& otherEndpoint) const;

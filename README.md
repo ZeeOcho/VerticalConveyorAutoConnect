@@ -15,12 +15,14 @@ I neither have much time nor any knowledge of Satisfactory Modding. And since I 
 CSS to eventually implement this kind of feature themselves, I decided to throw AI at it.
 That way, I will still have this functionality until that happens.
 
-What you also should now: attachment connections are still a little finnicky even in
+What you also should know: attachment connections are still a little finnicky even in
 vanilla itself. For example: when you are trying to build a lift between a floor hole and
-and open vertical attachment (*-splitter, *-merger), you can only start at the attachment side,
+an open vertical attachment (*-splitter, *-merger), you can only start at the attachment side,
 not at the floor hole (the lift will not snap to the attachment). This means:
-1. We cannot auto-connect (or manually build) between to open attachments.
-2. Mind this when build in blueprints. Be especially careful when deleting connections.
+1. With vanilla alone, we cannot auto-connect (or manually build) between two open attachments.
+   If another mod extends the actual Conveyor Lift hologram to support that placement, this mod
+   can use the additional capability automatically.
+2. Mind this when building blueprints. Be especially careful when deleting connections.
    Double-check the remaining connections to make sure they still transport items. You might
    need to re-build them.
 
@@ -34,7 +36,7 @@ vvv
 | Conveyor Floor Hole ↔ Conveyor Floor Hole | Supported |
 | Conveyor Floor Hole ↔ compatible Splitter/Merger lift port | Supported |
 | Compatible Splitter/Merger lift port ↔ Conveyor Floor Hole | Supported |
-| Splitter/Merger lift port ↔ Splitter/Merger lift port | Not synthesized |
+| Compatible Splitter/Merger lift port ↔ compatible Splitter/Merger lift port | Capability-dependent |
 
 "Compatible Splitter/Merger" is capability-based rather than a hard-coded class
 list. Normal Splitters/Mergers, Smart and Programmable Splitters, and Priority
@@ -42,8 +44,11 @@ Mergers are supported. Modded or future variants are supported automatically
 when they use Satisfactory's standard `AFGBuildableConveyorAttachment` vertical
 lift-port contract.
 
-Attachment ↔ attachment bridges are intentionally not synthesized because
-vanilla Conveyor Lift placement cannot complete that topology manually.
+Attachment ↔ attachment bridges are attempted only when the generated, real
+Conveyor Lift hologram reports that it can connect to the second attachment.
+Vanilla currently rejects that capability, so behavior without another mod is
+unchanged. A runtime extension such as `VerticalLogisticsQoL` can enable it
+without a hard dependency or installation check in this mod.
 
 ## Lift tier selection
 
@@ -65,6 +70,11 @@ validation.
 - Hard-invalid placements are rejected when vanilla rejects them.
 - The mod does not add guessed maximum heights, distances, clearance rules, or
   angular tolerances.
+
+Initial target discovery examines the complete vertical column through each
+open endpoint. This is only candidate discovery: every bridge is still configured
+as a real vanilla Conveyor Lift hologram and accepted only when vanilla reports
+that it can construct. The mod therefore adds no independent lift-length rule.
 
 The first physical vertical conveyor endpoint in a column terminates the search.
 The mod never skips through an occupied, unsupported, claimed, or incompatible
@@ -107,6 +117,9 @@ vanilla still considers two conveyor elements semantically connected.
 - No custom buildables or items are added.
 - Capability-compatible conveyor-attachment variants from other mods may work
   automatically; non-standard attachment implementations fail closed.
+- Attachment ↔ attachment placement is capability-driven. The mod calls the
+  live Conveyor Lift hologram API, so compatible runtime extensions can enable
+  it without being referenced as dependencies.
 
 ### Multiplayer / dedicated servers
 
@@ -129,7 +142,9 @@ If an endpoint looks aligned but does not auto-connect:
 2. for Floor Holes, verify the existing continuation is actually snapped through
    the hole rather than only geometrically aligned;
 3. after splitting or heavily editing a previously connected blueprint, rebuild
-   the seam-local conveyor connections and save it again.
+   the seam-local conveyor connections and save it again;
+4. compare the same endpoint pair with a manually configured vanilla Conveyor
+   Lift if an unusually long span is rejected.
 
 For detailed bug reports, include the Satisfactory version, SML version, mod
 version, endpoint topology, intended flow direction, and a game log.

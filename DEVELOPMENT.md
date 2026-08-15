@@ -6,7 +6,9 @@ This document was generated using ChatGPT. The basic ideas / principles of this 
 - Extend the auto-connect feature to vertical conveyor lifts until it gets implemented by CSS itself.
 - Be consistent with vanilla behavior:
   - we can connect: floor-hole ↔ floor-hole, and floor-hole ↔ [splitter / merger]
-  - vanilla does not allow building a lift beween to open vertical splitter / merger ports
+  - vanilla does not allow building a lift between two open vertical splitter / merger ports
+  - another mod may extend the real lift hologram to allow that placement; use
+    the runtime capability without depending on the mod itself
   - we may soft-clip the auto-connection
 - Inherit lift Mk. and orientation from already attached lift(s), where blueprint-side wins.
 - At least one side must already have an attached belt.
@@ -55,10 +57,15 @@ uses the exact validated components returned by that probe.
 Supported topology:
 
 - Floor Hole ↔ Floor Hole;
-- one compatible attachment ↔ one Floor Hole.
+- one compatible attachment ↔ one Floor Hole;
+- compatible attachment ↔ compatible attachment when the live Conveyor Lift
+  hologram accepts the second attachment endpoint.
 
-Attachment ↔ attachment is intentionally not synthesized because vanilla manual
-Conveyor Lift placement cannot complete that topology.
+The manager must not infer attachment ↔ attachment support from an installed-mod
+name or class list. It configures a real `AFGConveyorLiftHologram` and calls its
+`CanConnectToConnection()` method. Vanilla currently rejects the topology. A
+runtime hook such as `VerticalLogisticsQoL` can extend that method, which enables
+the bridge implicitly; otherwise the candidate fails closed.
 
 ## Four independent concepts
 
@@ -75,6 +82,10 @@ Keep these separate:
 
 For attachment ↔ Floor Hole, vanilla placement starts at the attachment
 regardless of ownership or transport role.
+
+For attachment ↔ attachment, placement starts at the transport-input attachment
+and the second attachment is accepted only through the live hologram capability
+check.
 
 ## Attachment placement state
 
@@ -96,6 +107,17 @@ Measured vanilla behavior:
 
 Port identity and transport direction are independent.
 
+Capability-extended attachment ↔ attachment state keeps the same placement-slot
+model:
+
+- placement slot 0 = transport-input attachment vertical connection;
+- placement slot 1 = transport-output attachment vertical connection;
+- `mSnappedPassthroughs = [nullptr, nullptr]`;
+- both `mSnappedConnectionComponents` entries contain the corresponding direct
+  attachment ports;
+- after applying transforms and connection directions, slot 1 must pass the
+  live lift hologram's `CanConnectToConnection()` check.
+
 ## Locked transport intent
 
 Direction is resolved while the preview state is valid and stored as normalized
@@ -113,9 +135,10 @@ attachments receive `BeginPlay()`.
 `mSavedDirections`. Before `BeginPlay`, a selected port can expose `FCD_ANY` or
 a concrete default/stale direction.
 
-For a blueprint-owned mixed bridge, restore the selected port from
-`mSavedDirections` before constructing the bridge child. Resolve the persisted
-index with `UFGFactoryConnectionComponent::SortComponentList`.
+For a blueprint-owned bridge, restore every selected attachment port from
+`mSavedDirections` before constructing the bridge child. Attachment ↔ attachment
+can put the blueprint-owned attachment in either placement slot. Resolve each
+persisted index with `UFGFactoryConnectionComponent::SortComponentList`.
 
 The persisted direction must be concrete and exactly match the transport role
 already locked during preview. Otherwise fail closed. Existing world attachments
@@ -143,6 +166,48 @@ Recipe precedence is:
 3. no recipe -> reject.
 
 Tier choice is independent of transport direction and attachment placement order.
+
+## Candidate discovery
+
+Vanilla `AFGBlueprintHologram` has one clearance detector. Its overlap callbacks
+feed nearby actors to every registered open-connection manager. The stock
+factory/pipe/rail managers therefore discover actors relative to the blueprint
+bounds, not relative to each open connection.
+
+That detector is a broadphase, not a semantic connection-distance contract. Its
+effective reach varies with an endpoint's position inside the blueprint bounds.
+Using it alone therefore causes a terminal near the top of a tall blueprint to
+discover much less vertical space than the same terminal near the centre.
+
+The vertical manager preserves the ordinary overlap feed but supplements it with
+one buildable-subsystem query through the complete world-height prism containing
+its source endpoint columns. Exact XY matching and no-endpoint-tunneling reduce
+that broadphase result to physical candidates. The generated, real
+`AFGConveyorLiftHologram` remains authoritative for length and constructibility;
+candidate discovery itself imposes no height limit.
+
+This intentionally allows arbitrarily long Floor Hole bridges when vanilla's
+Lift hologram allows them. If CSS later adds a maximum-height disqualifier to the
+normal Lift validation path, `CanConstruct()` will reject those candidates and
+the mod will inherit that shorter limit without its own range update.
+
+If the buildable subsystem is unavailable, fail closed to the ordinary vanilla
+nearby-actor feed rather than scanning all world buildables or introducing a
+fallback distance.
+
+## Automatic-connection representation
+
+Vanilla managers broadcast target/validity transitions through
+`mOnConnectionStateChanged`. `AFGBlueprintHologram` uses that callback to replace
+ordinary connection-direction indicators with its automatic-link
+representation.
+
+The vertical manager follows the same delegate contract. A blueprint-world
+factory connection may have a duplicated preview component attached to the
+hologram, so resolve and broadcast that existing duplicate from
+`mDuplicateConnectionToOriginalMap`; do not create a separate mod-owned icon.
+Floor Hole sides have no connection component of their own, so their
+representation uses the adjacent Conveyor Lift connection when one exists.
 
 ## No endpoint tunneling
 
