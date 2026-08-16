@@ -33,10 +33,6 @@ Run `U6-U9` and `D6-D9` in both capability environments:
 
 The compatibility test is behavioral. `VerticalConveyorAutoConnect` must not
 gain a plugin dependency, installation check, or type reference to the extension.
-Very-verbose logs should show `placement-end capability ... accepted=0` without
-the extension and `accepted=1` with it. This per-candidate trace intentionally
-uses `VeryVerbose` because an unsupported candidate is evaluated every preview
-update.
 
 For mixed supported cases also verify:
 
@@ -155,13 +151,6 @@ For detailed diagnostics:
 ```ini
 [Core.Log]
 LogVerticalConveyorAutoConnect=Verbose
-```
-
-For per-update capability probes, temporarily use:
-
-```ini
-[Core.Log]
-LogVerticalConveyorAutoConnect=VeryVerbose
 ```
 
 A bug report should include:

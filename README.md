@@ -50,6 +50,12 @@ Vanilla currently rejects that capability, so behavior without another mod is
 unchanged. A runtime extension such as `VerticalLogisticsQoL` can enable it
 without a hard dependency or installation check in this mod.
 
+For blueprint-owned attachments, the capability check uses the resolved preview
+position rather than blueprint-local component geometry. This compatibility path
+has been regression-tested with a Satisfactory 1.2-compatible build of
+`VerticalLogisticsQoL` across all Splitter/Merger pairings and both transport
+directions.
+
 ## Lift tier selection
 
 When a bridge needs a Conveyor Lift tier:

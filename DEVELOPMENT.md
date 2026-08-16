@@ -118,6 +118,35 @@ model:
 - after applying transforms and connection directions, slot 1 must pass the
   live lift hologram's `CanConnectToConnection()` check.
 
+## Capability-probe transform context
+
+`CanConnectToConnection()` is queried during blueprint preview, before the final
+blueprint actors exist. Both connection components supplied to that call must
+therefore represent the same world-space geometry that final lift placement will
+use.
+
+The synthetic Lift hologram does not automatically move its slot-1 connection
+component to `mTopTransform`. In addition, vanilla may not create a duplicated
+preview connection for a hidden vertical attachment port. In that fallback case,
+the original component remains attached to the BlueprintWorld buildable and its
+connector geometry is still blueprint-local.
+
+For the capability probe:
+
+- prefer an existing vanilla duplicate from
+  `mDuplicateConnectionToOriginalMap` when one represents the attachment port;
+- stage the synthetic Lift's slot-1 connection at the resolved endpoint location;
+- only when no duplicate exists, stage the BlueprintWorld attachment component
+  at the endpoint's resolved preview-world transform;
+- call the live hologram method, then immediately restore every component
+  transform that was staged.
+
+Staged preview components are made movable as required and remain movable for the
+hologram lifetime to avoid component re-registration on every preview tick. World
+attachments already expose world-space geometry and must not be staged. This is a
+validation-context correction only; it must not substitute a mod-defined
+acceptance rule for the live capability result.
+
 ## Locked transport intent
 
 Direction is resolved while the preview state is valid and stored as normalized

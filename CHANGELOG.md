@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here.
 
+## [1.0.2] - 2026-08-15
+
+### Fixed
+
+- Attachment ↔ attachment capability checks now evaluate blueprint-owned
+  vertical attachment ports at their resolved preview-world transforms when
+  vanilla has not created a duplicated preview connection. Compatible placement
+  extensions therefore receive the same endpoint geometry used for final
+  construction.
+
 ## [1.0.1] - 2026-08-15
 
 ### Changed
