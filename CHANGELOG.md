@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Generated Conveyor Lift finalization now preflights both endpoints before the
+  lift is constructed and revalidates both sides before either factory
+  connection is committed.
+- A rejected or incomplete finalization can no longer leave a returned bridge
+  with only one reciprocal factory connection or stale Floor Hole bookkeeping.
+- Blueprint-owned Floor Hole continuations are explicitly remapped by buildable
+  index and physical connection slot and checked against the constructed Floor
+  Hole's passthrough reference before linking.
+
+### Diagnostics
+
+- Added a read-only next-tick audit of reciprocal links, Floor Hole
+  backreferences, conveyor bucket membership, and saved/tick-group chain actor
+  ownership for every generated bridge.
+
 ## [1.0.2] - 2026-08-15
 
 ### Fixed

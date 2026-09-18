@@ -2,9 +2,11 @@
 
 #include "VerticalConveyorAutoConnect.h"
 #include "Buildables/FGBuildableConveyorAttachment.h"
+#include "Buildables/FGBuildableConveyorBase.h"
 #include "Buildables/FGBuildableConveyorLift.h"
 #include "Buildables/FGBuildablePassthrough.h"
 #include "Components/SceneComponent.h"
+#include "Engine/World.h"
 #include "FGBuildableSubsystem.h"
 #include "FGConstructDisqualifier.h"
 #include "FGFactoryConnectionComponent.h"
@@ -13,6 +15,7 @@
 #include "Hologram/FGConveyorAttachmentHologram.h"
 #include "Hologram/FGConveyorLiftHologram.h"
 #include "Misc/SecureHash.h"
+#include "TimerManager.h"
 
 FBlueprintVerticalConveyorConnectionManager::
 	FBlueprintVerticalConveyorConnectionManager(
@@ -535,6 +538,48 @@ void FBlueprintVerticalConveyorConnectionManager::Initialize(
 			state.BlueprintKind = endpoint.Kind;
 			state.BlueprintSide = endpoint.Side;
 			state.BlueprintConnectionName = endpoint.ConnectionName;
+
+			if (endpoint.Kind ==
+				EBlueprintVerticalEndpointKind::FloorHoleSide)
+			{
+				UFGFactoryConnectionComponent* continuation =
+					GetTransportConnectionAcrossEndpoint(endpoint);
+				state.BlueprintContinuationWasPresent = continuation != nullptr;
+				if (IsValid(continuation))
+				{
+					AFGBuildableConveyorLift* continuationOwner =
+						Cast<AFGBuildableConveyorLift>(
+							continuation->GetOwner());
+					state.BlueprintContinuationBuildableIndex =
+						buildables.IndexOfByKey(continuationOwner);
+					if (IsValid(continuationOwner))
+					{
+						if (continuation == continuationOwner->GetConnection0())
+						{
+							state.BlueprintContinuationConnectionIndex = 0;
+						}
+						else if (continuation ==
+							continuationOwner->GetConnection1())
+						{
+							state.BlueprintContinuationConnectionIndex = 1;
+						}
+					}
+
+					if (state.BlueprintContinuationBuildableIndex == INDEX_NONE ||
+						state.BlueprintContinuationConnectionIndex ==
+							INDEX_NONE)
+					{
+						UE_LOG(
+							LogVerticalConveyorAutoConnect,
+							Warning,
+							TEXT("VerticalConveyorAutoConnect: source continuation cannot be mapped as a blueprint lift component endpoint=%s continuation=%s owner=%s"),
+							*DescribeEndpoint(endpoint),
+							*GetNameSafe(continuation),
+							*GetNameSafe(continuationOwner));
+					}
+				}
+			}
+
 			state.LiftRecipe = GetEndpointLiftRecipe(endpoint);
 			if (state.LiftRecipe)
 			{
@@ -2127,6 +2172,7 @@ void FBlueprintVerticalConveyorConnectionManager::ResetAutomaticConnections()
 			state.IsValid || IsValid(state.TargetBuildable);
 		ClearTarget(state);
 		state.ConstructedBlueprintBuildable = nullptr;
+		state.ConstructedBlueprintContinuationConnection = nullptr;
 		state.HasSnappedTarget = false;
 		DisableBridge(state);
 		if (shouldBroadcast)
@@ -2148,6 +2194,50 @@ void FBlueprintVerticalConveyorConnectionManager::
 	for (int32 stateIndex = 0; stateIndex < ConnectionStates.Num(); ++stateIndex)
 	{
 		FConnectionState& state = ConnectionStates[stateIndex];
+		if (state.BlueprintContinuationBuildableIndex ==
+				blueprintBuildableIndex &&
+			state.BlueprintContinuationConnectionIndex != INDEX_NONE)
+		{
+			AFGBuildableConveyorLift* continuationLift =
+				Cast<AFGBuildableConveyorLift>(buildable);
+			UFGFactoryConnectionComponent* continuation = nullptr;
+			if (IsValid(continuationLift) &&
+				state.BlueprintContinuationConnectionIndex == 0)
+			{
+				continuation = continuationLift->GetConnection0();
+			}
+			else if (IsValid(continuationLift) &&
+				state.BlueprintContinuationConnectionIndex == 1)
+			{
+				continuation = continuationLift->GetConnection1();
+			}
+			if (IsValid(continuation))
+			{
+				state.ConstructedBlueprintContinuationConnection =
+					continuation;
+				UE_LOG(
+					LogVerticalConveyorAutoConnect,
+					Verbose,
+					TEXT("VerticalConveyorAutoConnect: remapped source continuation state=%d buildableIndex=%d connectionIndex=%d connection=%s"),
+					stateIndex,
+					blueprintBuildableIndex,
+					state.BlueprintContinuationConnectionIndex,
+					*GetNameSafe(continuation));
+			}
+			else
+			{
+				state.ConstructedBlueprintContinuationConnection = nullptr;
+				UE_LOG(
+					LogVerticalConveyorAutoConnect,
+					Warning,
+					TEXT("VerticalConveyorAutoConnect: failed to remap source continuation state=%d buildableIndex=%d connectionIndex=%d buildable=%s"),
+					stateIndex,
+					blueprintBuildableIndex,
+					state.BlueprintContinuationConnectionIndex,
+					*GetNameSafe(buildable));
+			}
+		}
+
 		if (state.BlueprintBuildableIndex == blueprintBuildableIndex &&
 			IsSupportedBuildable(buildable))
 		{
@@ -2268,110 +2358,199 @@ void FBlueprintVerticalConveyorConnectionManager::ConnectDirectly(
 	}
 }
 
-int32 FBlueprintVerticalConveyorConnectionManager::ConnectBridgeEndpoint(
-	AFGBuildableConveyorLift* lift,
-	const TCHAR* endpointName,
-	UFGFactoryConnectionComponent* bridgeConnection,
-	UFGFactoryConnectionComponent* outsideConnection,
-	const FEndpointRef& endpoint) const
+bool FBlueprintVerticalConveyorConnectionManager::
+	PreflightBridgeEndpointBeforeConstruct(
+		const FConnectionState& state,
+		const TCHAR* endpointName,
+		FBridgeEndpointPlan& endpointPlan) const
 {
-	if (!IsValid(bridgeConnection))
+	const FEndpointRef& endpoint = endpointPlan.Endpoint;
+	if (!IsValid(endpoint.Buildable) ||
+		(endpointPlan.ExpectedBridgeDirection !=
+			EFactoryConnectionDirection::FCD_INPUT &&
+		 endpointPlan.ExpectedBridgeDirection !=
+			EFactoryConnectionDirection::FCD_OUTPUT))
 	{
 		UE_LOG(
 			LogVerticalConveyorAutoConnect,
 			Warning,
-			TEXT("VerticalConveyorAutoConnect: %s endpoint %s has no bridge connection"),
-			*GetNameSafe(lift),
+			TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=invalid-endpoint-or-direction"),
+			*DescribeEndpoint(endpoint),
 			endpointName);
-		return 0;
+		return false;
 	}
 
-	if (!IsValid(outsideConnection))
+	if (endpoint.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide)
 	{
+		AFGBuildablePassthrough* floorHole =
+			Cast<AFGBuildablePassthrough>(endpoint.Buildable);
+		if (!IsConveyorFloorHole(floorHole))
+		{
+			return false;
+		}
+
+		UFGFactoryConnectionComponent* exposedConnection =
+			GetFloorHoleSnappedConnection(floorHole, endpoint.Side);
+		if (exposedConnection != nullptr)
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=exposed-floor-hole-occupied connection=%s"),
+				*DescribeEndpoint(endpoint),
+				endpointName,
+				*GetNameSafe(exposedConnection));
+			return false;
+		}
+	}
+
+	endpointPlan.OutsideConnection =
+		GetTransportConnectionAcrossEndpoint(endpoint);
+	endpointPlan.HadOutsideConnection =
+		endpointPlan.OutsideConnection != nullptr;
+
+	const bool isConstructedBlueprintEndpoint =
+		endpoint.Buildable == state.ConstructedBlueprintBuildable;
+	if (isConstructedBlueprintEndpoint &&
+		endpoint.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide)
+	{
+		if (state.BlueprintContinuationWasPresent)
+		{
+			if (state.BlueprintContinuationBuildableIndex == INDEX_NONE ||
+				!IsValid(
+					state.ConstructedBlueprintContinuationConnection) ||
+				endpointPlan.OutsideConnection !=
+					state.ConstructedBlueprintContinuationConnection)
+			{
+				UE_LOG(
+					LogVerticalConveyorAutoConnect,
+					Warning,
+					TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=source-continuation-remap-mismatch floorHoleTo=%s remapped=%s sourceIndex=%d"),
+					*DescribeEndpoint(endpoint),
+					endpointName,
+					*GetNameSafe(endpointPlan.OutsideConnection),
+					*GetNameSafe(
+						state.ConstructedBlueprintContinuationConnection),
+					state.BlueprintContinuationBuildableIndex);
+				return false;
+			}
+		}
+		else if (endpointPlan.HadOutsideConnection)
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=unexpected-source-continuation floorHoleTo=%s"),
+				*DescribeEndpoint(endpoint),
+				endpointName,
+				*GetNameSafe(endpointPlan.OutsideConnection));
+			return false;
+		}
+	}
+
+	if (!endpointPlan.HadOutsideConnection)
+	{
+		if (endpoint.Kind ==
+			EBlueprintVerticalEndpointKind::AttachmentPort)
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=missing-attachment-port"),
+				*DescribeEndpoint(endpoint),
+				endpointName);
+			return false;
+		}
+
 		UE_LOG(
 			LogVerticalConveyorAutoConnect,
 			Verbose,
-			TEXT("VerticalConveyorAutoConnect: %s endpoint %s terminates at bare %s"),
-			*GetNameSafe(lift),
-			endpointName,
-			*DescribeEndpoint(endpoint));
-		return -1;
+			TEXT("VerticalConveyorAutoConnect: bridge preflight endpoint=%s side=%s terminates=bare"),
+			*DescribeEndpoint(endpoint),
+			endpointName);
+		return true;
 	}
 
-	if (bridgeConnection->GetConnection() == outsideConnection &&
-		outsideConnection->GetConnection() == bridgeConnection)
-	{
-		return 1;
-	}
-
-	if ((bridgeConnection->IsConnected() &&
-			bridgeConnection->GetConnection() != outsideConnection) ||
-		(outsideConnection->IsConnected() &&
-			outsideConnection->GetConnection() != bridgeConnection))
+	UFGFactoryConnectionComponent* outsideConnection =
+		endpointPlan.OutsideConnection;
+	if (!IsValid(outsideConnection) ||
+		(endpoint.Kind ==
+				EBlueprintVerticalEndpointKind::AttachmentPort &&
+		 !outsideConnection->IsConnectionVertical()))
 	{
 		UE_LOG(
 			LogVerticalConveyorAutoConnect,
 			Warning,
-			TEXT("VerticalConveyorAutoConnect: cannot link %s endpoint %s; bridge alreadyTo=%s outside=%s alreadyTo=%s"),
-			*GetNameSafe(lift),
+			TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=invalid-outside-connection outside=%s"),
+			*DescribeEndpoint(endpoint),
 			endpointName,
-			*GetNameSafe(bridgeConnection->GetConnection()),
-			*GetNameSafe(outsideConnection),
-			*GetNameSafe(outsideConnection->GetConnection()));
-		return 0;
+			*GetNameSafe(outsideConnection));
+		return false;
 	}
 
-	if (outsideConnection->GetDirection() ==
-		EFactoryConnectionDirection::FCD_ANY)
+	if (endpoint.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide)
 	{
-		const EFactoryConnectionDirection required =
-			OppositeDirection(bridgeConnection->GetDirection());
-		if (required == EFactoryConnectionDirection::FCD_ANY)
+		AFGBuildableConveyorLift* continuationLift =
+			Cast<AFGBuildableConveyorLift>(outsideConnection->GetOwner());
+		if (!IsValid(continuationLift) ||
+			(outsideConnection != continuationLift->GetConnection0() &&
+			 outsideConnection != continuationLift->GetConnection1()))
 		{
-			return 0;
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=invalid-floor-hole-continuation outside=%s owner=%s"),
+				*DescribeEndpoint(endpoint),
+				endpointName,
+				*GetNameSafe(outsideConnection),
+				*GetNameSafe(outsideConnection->GetOwner()));
+			return false;
 		}
-		outsideConnection->SetDirection(required);
 	}
 
-	if (bridgeConnection->CanConnectTo(outsideConnection))
-	{
-		bridgeConnection->SetConnection(outsideConnection);
-	}
-	else if (outsideConnection->CanConnectTo(bridgeConnection))
-	{
-		outsideConnection->SetConnection(bridgeConnection);
-	}
-	else
+	if (outsideConnection->IsConnected() ||
+		outsideConnection->GetConnection() != nullptr)
 	{
 		UE_LOG(
 			LogVerticalConveyorAutoConnect,
 			Warning,
-			TEXT("VerticalConveyorAutoConnect: cannot link %s endpoint %s bridge=%s(%d) outside=%s(%d)"),
-			*GetNameSafe(lift),
+			TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=outside-already-connected outside=%s outsideTo=%s connected=%d"),
+			*DescribeEndpoint(endpoint),
 			endpointName,
-			*GetNameSafe(bridgeConnection),
-			static_cast<int32>(bridgeConnection->GetDirection()),
 			*GetNameSafe(outsideConnection),
-			static_cast<int32>(outsideConnection->GetDirection()));
-		return 0;
+			*GetNameSafe(outsideConnection->GetConnection()),
+			outsideConnection->IsConnected() ? 1 : 0);
+		return false;
 	}
 
-	return bridgeConnection->GetConnection() == outsideConnection &&
-		outsideConnection->GetConnection() == bridgeConnection
-		? 1
-		: 0;
+	const EFactoryConnectionDirection requiredOutsideDirection =
+		OppositeDirection(endpointPlan.ExpectedBridgeDirection);
+	const EFactoryConnectionDirection outsideDirection =
+		outsideConnection->GetDirection();
+	if (requiredOutsideDirection == EFactoryConnectionDirection::FCD_ANY ||
+		(outsideDirection != EFactoryConnectionDirection::FCD_ANY &&
+		 outsideDirection != requiredOutsideDirection))
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: bridge preflight rejected endpoint=%s side=%s reason=direction-mismatch bridgeDirection=%d outsideDirection=%d requiredOutsideDirection=%d"),
+			*DescribeEndpoint(endpoint),
+			endpointName,
+			static_cast<int32>(endpointPlan.ExpectedBridgeDirection),
+			static_cast<int32>(outsideDirection),
+			static_cast<int32>(requiredOutsideDirection));
+		return false;
+	}
+
+	return true;
 }
 
-void FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
+bool FBlueprintVerticalConveyorConnectionManager::PrepareBridgeFinalizationPlan(
 	FConnectionState& state,
-	AFGBuildableConveyorLift* lift) const
+	FBridgeFinalizationPlan& outPlan) const
 {
-	const FEndpointRef blueprintEndpoint = GetBlueprintEndpoint(state, true);
-	const FEndpointRef targetEndpoint = GetTargetEndpoint(state);
-	if (!IsValid(lift))
-	{
-		return;
-	}
+	outPlan = {};
 
 	const EFactoryConnectionDirection lowerDirection =
 		state.ResolvedLowerEndpointDirection;
@@ -2381,9 +2560,16 @@ void FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
 		UE_LOG(
 			LogVerticalConveyorAutoConnect,
 			Warning,
-			TEXT("VerticalConveyorAutoConnect: refusing to finalize %s; snapped state has no resolved transport direction"),
-			*GetNameSafe(lift));
-		return;
+			TEXT("VerticalConveyorAutoConnect: bridge preflight rejected reason=missing-transport-direction"));
+		return false;
+	}
+
+	const FEndpointRef blueprintEndpoint = GetBlueprintEndpoint(state, true);
+	const FEndpointRef targetEndpoint = GetTargetEndpoint(state);
+	if (!IsValid(blueprintEndpoint.Buildable) ||
+		!IsValid(targetEndpoint.Buildable))
+	{
+		return false;
 	}
 
 	FEndpointRef lowerEndpoint;
@@ -2400,11 +2586,496 @@ void FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
 		upperEndpoint = blueprintEndpoint;
 	}
 
-	const bool expectedFlowsUpwards =
+	outPlan.ExpectedFlowsUpwards =
 		lowerDirection == EFactoryConnectionDirection::FCD_INPUT;
-	const bool actorFlowsUpwards =
-		lift->GetConveyorLiftFlowDirection() ==
-		EFGBuildableConveyorLiftDirection::LD_Upwards;
+	outPlan.Input.Endpoint = outPlan.ExpectedFlowsUpwards
+		? lowerEndpoint
+		: upperEndpoint;
+	outPlan.Output.Endpoint = outPlan.ExpectedFlowsUpwards
+		? upperEndpoint
+		: lowerEndpoint;
+	outPlan.Input.ExpectedBridgeDirection =
+		EFactoryConnectionDirection::FCD_INPUT;
+	outPlan.Output.ExpectedBridgeDirection =
+		EFactoryConnectionDirection::FCD_OUTPUT;
+
+	if (!PreflightBridgeEndpointBeforeConstruct(
+			state,
+			TEXT("input"),
+			outPlan.Input) ||
+		!PreflightBridgeEndpointBeforeConstruct(
+			state,
+			TEXT("output"),
+			outPlan.Output))
+	{
+		return false;
+	}
+
+	if (outPlan.Input.HadOutsideConnection &&
+		outPlan.Output.HadOutsideConnection &&
+		outPlan.Input.OutsideConnection ==
+			outPlan.Output.OutsideConnection)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: bridge preflight rejected reason=shared-outside-connection outside=%s input=%s output=%s"),
+			*GetNameSafe(outPlan.Input.OutsideConnection),
+			*DescribeEndpoint(outPlan.Input.Endpoint),
+			*DescribeEndpoint(outPlan.Output.Endpoint));
+		return false;
+	}
+
+	UE_LOG(
+		LogVerticalConveyorAutoConnect,
+		Verbose,
+		TEXT("VerticalConveyorAutoConnect: bridge preflight accepted flow=%s input=%s inputOutside=%s output=%s outputOutside=%s"),
+		outPlan.ExpectedFlowsUpwards ? TEXT("up") : TEXT("down"),
+		*DescribeEndpoint(outPlan.Input.Endpoint),
+		*GetNameSafe(outPlan.Input.OutsideConnection),
+		*DescribeEndpoint(outPlan.Output.Endpoint),
+		*GetNameSafe(outPlan.Output.OutsideConnection));
+	return true;
+}
+
+bool FBlueprintVerticalConveyorConnectionManager::
+	PrepareConstructedBridgeEndpoint(
+		AFGBuildableConveyorLift* lift,
+		const TCHAR* endpointName,
+		UFGFactoryConnectionComponent* bridgeConnection,
+		FBridgeEndpointPlan& endpointPlan) const
+{
+	endpointPlan.BridgeConnection = bridgeConnection;
+	endpointPlan.WasAlreadyLinked = false;
+	endpointPlan.ChangedOutsideDirection = false;
+
+	if (!IsValid(bridgeConnection) ||
+		bridgeConnection->GetDirection() !=
+			endpointPlan.ExpectedBridgeDirection)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: refusing to finalize %s endpoint=%s reason=bridge-direction-mismatch bridge=%s direction=%d expected=%d"),
+			*GetNameSafe(lift),
+			endpointName,
+			*GetNameSafe(bridgeConnection),
+			IsValid(bridgeConnection)
+				? static_cast<int32>(bridgeConnection->GetDirection())
+				: -1,
+			static_cast<int32>(endpointPlan.ExpectedBridgeDirection));
+		return false;
+	}
+
+	UFGFactoryConnectionComponent* currentOutsideConnection =
+		GetTransportConnectionAcrossEndpoint(endpointPlan.Endpoint);
+	if (currentOutsideConnection != endpointPlan.OutsideConnection ||
+		(endpointPlan.HadOutsideConnection &&
+		 !IsValid(endpointPlan.OutsideConnection)))
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: refusing to finalize %s endpoint=%s reason=outside-connection-changed expected=%s actual=%s"),
+			*GetNameSafe(lift),
+			endpointName,
+			*GetNameSafe(endpointPlan.OutsideConnection),
+			*GetNameSafe(currentOutsideConnection));
+		return false;
+	}
+
+	if (endpointPlan.Endpoint.Kind ==
+		EBlueprintVerticalEndpointKind::FloorHoleSide)
+	{
+		AFGBuildablePassthrough* floorHole =
+			Cast<AFGBuildablePassthrough>(endpointPlan.Endpoint.Buildable);
+		UFGFactoryConnectionComponent* exposedConnection =
+			GetFloorHoleSnappedConnection(
+				floorHole,
+				endpointPlan.Endpoint.Side);
+		if (exposedConnection != nullptr &&
+			exposedConnection != bridgeConnection)
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: refusing to finalize %s endpoint=%s reason=floor-hole-changed floorHole=%s exposedTo=%s expected=%s"),
+				*GetNameSafe(lift),
+				endpointName,
+				*GetNameSafe(floorHole),
+				*GetNameSafe(exposedConnection),
+				*GetNameSafe(bridgeConnection));
+			return false;
+		}
+	}
+
+	UFGFactoryConnectionComponent* bridgePeer =
+		bridgeConnection->GetConnection();
+	if (!endpointPlan.HadOutsideConnection)
+	{
+		if (bridgeConnection->IsConnected() || bridgePeer != nullptr)
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: refusing to finalize %s endpoint=%s reason=bare-endpoint-auto-linked bridgeTo=%s connected=%d"),
+				*GetNameSafe(lift),
+				endpointName,
+				*GetNameSafe(bridgePeer),
+				bridgeConnection->IsConnected() ? 1 : 0);
+			return false;
+		}
+		return true;
+	}
+
+	UFGFactoryConnectionComponent* outsideConnection =
+		endpointPlan.OutsideConnection;
+	UFGFactoryConnectionComponent* outsidePeer =
+		outsideConnection->GetConnection();
+	const bool isReciprocal =
+		bridgePeer == outsideConnection && outsidePeer == bridgeConnection;
+	if (isReciprocal)
+	{
+		if (!bridgeConnection->IsConnected() ||
+			!outsideConnection->IsConnected())
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: refusing to finalize %s endpoint=%s reason=reciprocal-pointer-flag-mismatch bridgeConnected=%d outsideConnected=%d"),
+				*GetNameSafe(lift),
+				endpointName,
+				bridgeConnection->IsConnected() ? 1 : 0,
+				outsideConnection->IsConnected() ? 1 : 0);
+			return false;
+		}
+		endpointPlan.WasAlreadyLinked = true;
+	}
+	else if (bridgeConnection->IsConnected() || bridgePeer != nullptr ||
+		outsideConnection->IsConnected() || outsidePeer != nullptr)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: refusing to finalize %s endpoint=%s reason=non-reciprocal-or-conflicting-link bridgeTo=%s bridgeConnected=%d outside=%s outsideTo=%s outsideConnected=%d"),
+			*GetNameSafe(lift),
+			endpointName,
+			*GetNameSafe(bridgePeer),
+			bridgeConnection->IsConnected() ? 1 : 0,
+			*GetNameSafe(outsideConnection),
+			*GetNameSafe(outsidePeer),
+			outsideConnection->IsConnected() ? 1 : 0);
+		return false;
+	}
+
+	endpointPlan.OriginalOutsideDirection =
+		outsideConnection->GetDirection();
+	const EFactoryConnectionDirection requiredOutsideDirection =
+		OppositeDirection(endpointPlan.ExpectedBridgeDirection);
+	if (endpointPlan.OriginalOutsideDirection !=
+			EFactoryConnectionDirection::FCD_ANY &&
+		endpointPlan.OriginalOutsideDirection != requiredOutsideDirection)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: refusing to finalize %s endpoint=%s reason=outside-direction-changed outside=%s direction=%d expected=%d"),
+			*GetNameSafe(lift),
+			endpointName,
+			*GetNameSafe(outsideConnection),
+			static_cast<int32>(endpointPlan.OriginalOutsideDirection),
+			static_cast<int32>(requiredOutsideDirection));
+		return false;
+	}
+
+	return true;
+}
+
+bool FBlueprintVerticalConveyorConnectionManager::
+	ApplyBridgeEndpointBookkeeping(
+		AFGBuildableConveyorLift* lift,
+		const TCHAR* endpointName,
+		FBridgeEndpointPlan& endpointPlan) const
+{
+	UFGFactoryConnectionComponent* bridgeConnection =
+		endpointPlan.BridgeConnection;
+	if (!IsValid(bridgeConnection))
+	{
+		return false;
+	}
+
+	if (endpointPlan.HadOutsideConnection)
+	{
+		UFGFactoryConnectionComponent* outsideConnection =
+			endpointPlan.OutsideConnection;
+		if (!IsValid(outsideConnection))
+		{
+			return false;
+		}
+
+		const EFactoryConnectionDirection requiredOutsideDirection =
+			OppositeDirection(endpointPlan.ExpectedBridgeDirection);
+		if (outsideConnection->GetDirection() ==
+			EFactoryConnectionDirection::FCD_ANY)
+		{
+			outsideConnection->SetDirection(requiredOutsideDirection);
+			endpointPlan.ChangedOutsideDirection = true;
+		}
+		if (outsideConnection->GetDirection() != requiredOutsideDirection)
+		{
+			return false;
+		}
+	}
+
+	if (endpointPlan.Endpoint.Kind ==
+		EBlueprintVerticalEndpointKind::FloorHoleSide)
+	{
+		AFGBuildablePassthrough* floorHole =
+			Cast<AFGBuildablePassthrough>(endpointPlan.Endpoint.Buildable);
+		UFGFactoryConnectionComponent* exposedConnection =
+			GetFloorHoleSnappedConnection(
+				floorHole,
+				endpointPlan.Endpoint.Side);
+		if (exposedConnection == nullptr)
+		{
+			SetFloorHoleSnappedConnection(
+				floorHole,
+				endpointPlan.Endpoint.Side,
+				bridgeConnection);
+		}
+		else if (exposedConnection != bridgeConnection)
+		{
+			return false;
+		}
+	}
+
+	if (endpointPlan.HadOutsideConnection &&
+		!endpointPlan.WasAlreadyLinked)
+	{
+		UFGFactoryConnectionComponent* outsideConnection =
+			endpointPlan.OutsideConnection;
+		if (!bridgeConnection->CanConnectTo(outsideConnection) &&
+			!outsideConnection->CanConnectTo(bridgeConnection))
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: refusing to link %s endpoint=%s reason=can-connect-rejected bridge=%s(%d) outside=%s(%d)"),
+				*GetNameSafe(lift),
+				endpointName,
+				*GetNameSafe(bridgeConnection),
+				static_cast<int32>(bridgeConnection->GetDirection()),
+				*GetNameSafe(outsideConnection),
+				static_cast<int32>(outsideConnection->GetDirection()));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+int32 FBlueprintVerticalConveyorConnectionManager::ConnectBridgeEndpoint(
+	AFGBuildableConveyorLift* lift,
+	const TCHAR* endpointName,
+	FBridgeEndpointPlan& endpointPlan) const
+{
+	if (!endpointPlan.HadOutsideConnection)
+	{
+		return -1;
+	}
+
+	UFGFactoryConnectionComponent* bridgeConnection =
+		endpointPlan.BridgeConnection;
+	UFGFactoryConnectionComponent* outsideConnection =
+		endpointPlan.OutsideConnection;
+	if (!IsValid(bridgeConnection) || !IsValid(outsideConnection))
+	{
+		return 0;
+	}
+
+	if (endpointPlan.WasAlreadyLinked)
+	{
+		return bridgeConnection->GetConnection() == outsideConnection &&
+			outsideConnection->GetConnection() == bridgeConnection
+			? 1
+			: 0;
+	}
+
+	if (bridgeConnection->CanConnectTo(outsideConnection))
+	{
+		bridgeConnection->SetConnection(outsideConnection);
+	}
+	else if (outsideConnection->CanConnectTo(bridgeConnection))
+	{
+		outsideConnection->SetConnection(bridgeConnection);
+	}
+	else
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: link changed after preflight lift=%s endpoint=%s bridge=%s outside=%s"),
+			*GetNameSafe(lift),
+			endpointName,
+			*GetNameSafe(bridgeConnection),
+			*GetNameSafe(outsideConnection));
+		return 0;
+	}
+
+	const bool isReciprocal =
+		bridgeConnection->GetConnection() == outsideConnection &&
+		outsideConnection->GetConnection() == bridgeConnection &&
+		bridgeConnection->IsConnected() && outsideConnection->IsConnected();
+	return isReciprocal ? 1 : 0;
+}
+
+bool FBlueprintVerticalConveyorConnectionManager::
+	ValidateBridgeEndpointPostCondition(
+		const TCHAR* endpointName,
+		const FBridgeEndpointPlan& endpointPlan) const
+{
+	UFGFactoryConnectionComponent* bridgeConnection =
+		endpointPlan.BridgeConnection;
+	bool isValid =
+		IsValid(bridgeConnection) &&
+		bridgeConnection->GetDirection() ==
+			endpointPlan.ExpectedBridgeDirection &&
+		GetTransportConnectionAcrossEndpoint(endpointPlan.Endpoint) ==
+			endpointPlan.OutsideConnection;
+
+	if (isValid && endpointPlan.Endpoint.Kind ==
+		EBlueprintVerticalEndpointKind::FloorHoleSide)
+	{
+		isValid = GetFloorHoleSnappedConnection(
+			Cast<AFGBuildablePassthrough>(endpointPlan.Endpoint.Buildable),
+			endpointPlan.Endpoint.Side) == bridgeConnection;
+	}
+
+	if (isValid && endpointPlan.HadOutsideConnection)
+	{
+		UFGFactoryConnectionComponent* outsideConnection =
+			endpointPlan.OutsideConnection;
+		isValid =
+			IsValid(outsideConnection) &&
+			outsideConnection->GetDirection() ==
+				OppositeDirection(endpointPlan.ExpectedBridgeDirection) &&
+			bridgeConnection->GetConnection() == outsideConnection &&
+			outsideConnection->GetConnection() == bridgeConnection &&
+			bridgeConnection->IsConnected() &&
+			outsideConnection->IsConnected();
+	}
+	else if (isValid)
+	{
+		isValid = !bridgeConnection->IsConnected() &&
+			bridgeConnection->GetConnection() == nullptr;
+	}
+
+	if (!isValid)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: bridge post-condition failed endpoint=%s bridge=%s bridgeTo=%s outside=%s outsideTo=%s"),
+			endpointName,
+			*GetNameSafe(bridgeConnection),
+			IsValid(bridgeConnection)
+				? *GetNameSafe(bridgeConnection->GetConnection())
+				: TEXT("<invalid>"),
+			*GetNameSafe(endpointPlan.OutsideConnection),
+			IsValid(endpointPlan.OutsideConnection)
+				? *GetNameSafe(
+					endpointPlan.OutsideConnection->GetConnection())
+				: TEXT("<none>"));
+	}
+	return isValid;
+}
+
+void FBlueprintVerticalConveyorConnectionManager::RollBackBridgeFinalization(
+	AFGBuildableConveyorLift* lift,
+	FBridgeFinalizationPlan& plan) const
+{
+	auto rollBackEndpoint = [this, lift](
+		const TCHAR* endpointName,
+		FBridgeEndpointPlan& endpointPlan)
+	{
+		UFGFactoryConnectionComponent* bridgeConnection =
+			endpointPlan.BridgeConnection;
+		UFGFactoryConnectionComponent* outsideConnection =
+			endpointPlan.OutsideConnection;
+
+		if (IsValid(bridgeConnection))
+		{
+			UFGFactoryConnectionComponent* peer =
+				bridgeConnection->GetConnection();
+			if (IsValid(peer) && peer->GetConnection() == bridgeConnection)
+			{
+				bridgeConnection->ClearConnection();
+			}
+			else if (peer != nullptr || bridgeConnection->IsConnected())
+			{
+				UE_LOG(
+					LogVerticalConveyorAutoConnect,
+					Warning,
+					TEXT("VerticalConveyorAutoConnect: rollback found a non-reciprocal bridge connection lift=%s endpoint=%s bridge=%s bridgeTo=%s connected=%d"),
+					*GetNameSafe(lift),
+					endpointName,
+					*GetNameSafe(bridgeConnection),
+					*GetNameSafe(peer),
+					bridgeConnection->IsConnected() ? 1 : 0);
+			}
+		}
+
+		if (endpointPlan.Endpoint.Kind ==
+			EBlueprintVerticalEndpointKind::FloorHoleSide)
+		{
+			AFGBuildablePassthrough* floorHole =
+				Cast<AFGBuildablePassthrough>(endpointPlan.Endpoint.Buildable);
+			UFGFactoryConnectionComponent* exposedConnection =
+				GetFloorHoleSnappedConnection(
+					floorHole,
+					endpointPlan.Endpoint.Side);
+			if (exposedConnection == bridgeConnection ||
+				(IsValid(exposedConnection) &&
+				 exposedConnection->GetOwner() == lift))
+			{
+				SetFloorHoleSnappedConnection(
+					floorHole,
+					endpointPlan.Endpoint.Side,
+					nullptr);
+			}
+		}
+
+		if (endpointPlan.ChangedOutsideDirection &&
+			IsValid(outsideConnection) &&
+			!outsideConnection->IsConnected() &&
+			outsideConnection->GetConnection() == nullptr)
+		{
+			outsideConnection->SetDirection(
+				endpointPlan.OriginalOutsideDirection);
+		}
+	};
+
+	rollBackEndpoint(TEXT("input"), plan.Input);
+	rollBackEndpoint(TEXT("output"), plan.Output);
+	if (IsValid(lift))
+	{
+		lift->OnRep_SnappedPassthroughs();
+	}
+}
+
+FBlueprintVerticalConveyorConnectionManager::FBridgeFinalizationResult
+FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
+	FConnectionState& state,
+	FBridgeFinalizationPlan& plan,
+	AFGBuildableConveyorLift* lift) const
+{
+	FBridgeFinalizationResult result;
+	if (!IsValid(lift))
+	{
+		result.Status = EBridgeFinalizationStatus::InvalidLift;
+		return result;
+	}
+
 	UFGFactoryConnectionComponent* connection0 = lift->GetConnection0();
 	UFGFactoryConnectionComponent* connection1 = lift->GetConnection1();
 	if (!IsValid(connection0) || !IsValid(connection1))
@@ -2414,14 +3085,13 @@ void FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
 			Warning,
 			TEXT("VerticalConveyorAutoConnect: refusing to finalize %s; constructed lift is missing connection components"),
 			*GetNameSafe(lift));
-		return;
+		result.Status = EBridgeFinalizationStatus::LiftStateMismatch;
+		return result;
 	}
 
 	// Attachment-first vanilla placement can reverse the hologram's physical slot
-	// order: manual state has own0=OUTPUT, own1=INPUT when slot 0 is the transport
-	// output. Therefore GetConnection0()/GetConnection1() are physical slots, not a
-	// universally valid input/output ordering. Resolve transport identity from the
-	// constructed component directions instead of assuming indices.
+	// order. Resolve transport identity from the constructed directions instead of
+	// assuming GetConnection0() is always input and GetConnection1() output.
 	UFGFactoryConnectionComponent* inputConnection = nullptr;
 	UFGFactoryConnectionComponent* outputConnection = nullptr;
 	if (connection0->GetDirection() == EFactoryConnectionDirection::FCD_INPUT &&
@@ -2430,7 +3100,8 @@ void FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
 		inputConnection = connection0;
 		outputConnection = connection1;
 	}
-	else if (connection0->GetDirection() == EFactoryConnectionDirection::FCD_OUTPUT &&
+	else if (connection0->GetDirection() ==
+				EFactoryConnectionDirection::FCD_OUTPUT &&
 		connection1->GetDirection() == EFactoryConnectionDirection::FCD_INPUT)
 	{
 		inputConnection = connection1;
@@ -2445,84 +3116,314 @@ void FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
 			*GetNameSafe(lift),
 			static_cast<int32>(connection0->GetDirection()),
 			static_cast<int32>(connection1->GetDirection()));
-		return;
+		result.Status = EBridgeFinalizationStatus::LiftStateMismatch;
+		return result;
 	}
 
-	if (actorFlowsUpwards != expectedFlowsUpwards)
+	plan.Input.BridgeConnection = inputConnection;
+	plan.Output.BridgeConnection = outputConnection;
+	const bool actorFlowsUpwards =
+		lift->GetConveyorLiftFlowDirection() ==
+		EFGBuildableConveyorLiftDirection::LD_Upwards;
+	if (state.ResolvedLowerEndpointDirection ==
+			EFactoryConnectionDirection::FCD_ANY ||
+		actorFlowsUpwards != plan.ExpectedFlowsUpwards)
 	{
 		UE_LOG(
 			LogVerticalConveyorAutoConnect,
 			Warning,
 			TEXT("VerticalConveyorAutoConnect: refusing to finalize %s expectedFlow=%s actorFlow=%s c0=%d c1=%d"),
 			*GetNameSafe(lift),
-			expectedFlowsUpwards ? TEXT("up") : TEXT("down"),
+			plan.ExpectedFlowsUpwards ? TEXT("up") : TEXT("down"),
 			actorFlowsUpwards ? TEXT("up") : TEXT("down"),
 			static_cast<int32>(connection0->GetDirection()),
 			static_cast<int32>(connection1->GetDirection()));
-		return;
+		RollBackBridgeFinalization(lift, plan);
+		result.Status = EBridgeFinalizationStatus::LiftStateMismatch;
+		return result;
 	}
 
-	const FEndpointRef& inputEndpoint =
-		expectedFlowsUpwards ? lowerEndpoint : upperEndpoint;
-	const FEndpointRef& outputEndpoint =
-		expectedFlowsUpwards ? upperEndpoint : lowerEndpoint;
-
-	// Capture the transport connection ACROSS each endpoint before changing any
-	// floor-hole snapped bookkeeping. SetTop/BottomSnappedConnection mutates the
-	// passthrough state; resolving the opposite side afterwards can therefore turn
-	// a real continuing lift into an apparent bare endpoint (the D1/T3 symptom).
-	UFGFactoryConnectionComponent* inputOutsideConnection =
-		GetTransportConnectionAcrossEndpoint(inputEndpoint);
-	UFGFactoryConnectionComponent* outputOutsideConnection =
-		GetTransportConnectionAcrossEndpoint(outputEndpoint);
-
-	UE_LOG(
-		LogVerticalConveyorAutoConnect,
-		Verbose,
-		TEXT("VerticalConveyorAutoConnect: final-endpoints %s inputOutside=%s outputOutside=%s"),
-		*GetNameSafe(lift),
-		*GetNameSafe(inputOutsideConnection),
-		*GetNameSafe(outputOutsideConnection));
-
-	if (inputEndpoint.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide)
+	if (!PrepareConstructedBridgeEndpoint(
+			lift,
+			TEXT("input"),
+			inputConnection,
+			plan.Input) ||
+		!PrepareConstructedBridgeEndpoint(
+			lift,
+			TEXT("output"),
+			outputConnection,
+			plan.Output))
 	{
-		SetFloorHoleSnappedConnection(
-			Cast<AFGBuildablePassthrough>(inputEndpoint.Buildable),
-			inputEndpoint.Side,
-			inputConnection);
-	}
-	if (outputEndpoint.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide)
-	{
-		SetFloorHoleSnappedConnection(
-			Cast<AFGBuildablePassthrough>(outputEndpoint.Buildable),
-			outputEndpoint.Side,
-			outputConnection);
+		RollBackBridgeFinalization(lift, plan);
+		result.Status = EBridgeFinalizationStatus::EndpointChanged;
+		return result;
 	}
 
-	const int32 inputLink = ConnectBridgeEndpoint(
+	// Commit preparation for BOTH endpoints before SetConnection is called on
+	// either one. This preserves the vanilla-tested Floor Hole bookkeeping order
+	// while preventing a deterministic second-side rejection from leaving the
+	// first side linked.
+	if (!ApplyBridgeEndpointBookkeeping(
+			lift,
+			TEXT("input"),
+			plan.Input) ||
+		!ApplyBridgeEndpointBookkeeping(
+			lift,
+			TEXT("output"),
+			plan.Output))
+	{
+		RollBackBridgeFinalization(lift, plan);
+		result.Status = EBridgeFinalizationStatus::LinkRejected;
+		return result;
+	}
+
+	result.InputLink = ConnectBridgeEndpoint(
 		lift,
 		TEXT("input"),
-		inputConnection,
-		inputOutsideConnection,
-		inputEndpoint);
-	const int32 outputLink = ConnectBridgeEndpoint(
+		plan.Input);
+	result.OutputLink = ConnectBridgeEndpoint(
 		lift,
 		TEXT("output"),
-		outputConnection,
-		outputOutsideConnection,
-		outputEndpoint);
-	lift->OnRep_SnappedPassthroughs();
+		plan.Output);
+	if (result.InputLink == 0 || result.OutputLink == 0)
+	{
+		RollBackBridgeFinalization(lift, plan);
+		result.Status = EBridgeFinalizationStatus::LinkRejected;
+		return result;
+	}
 
+	lift->OnRep_SnappedPassthroughs();
+	if (!ValidateBridgeEndpointPostCondition(TEXT("input"), plan.Input) ||
+		!ValidateBridgeEndpointPostCondition(TEXT("output"), plan.Output))
+	{
+		RollBackBridgeFinalization(lift, plan);
+		result.Status = EBridgeFinalizationStatus::PostConditionFailed;
+		return result;
+	}
+
+	result.Status = EBridgeFinalizationStatus::Succeeded;
 	UE_LOG(
 		LogVerticalConveyorAutoConnect,
 		Verbose,
 		TEXT("VerticalConveyorAutoConnect: finalized %s flow=%s input=%s output=%s inputLink=%d outputLink=%d"),
 		*GetNameSafe(lift),
-		expectedFlowsUpwards ? TEXT("up") : TEXT("down"),
-		*DescribeEndpoint(inputEndpoint),
-		*DescribeEndpoint(outputEndpoint),
-		inputLink,
-		outputLink);
+		plan.ExpectedFlowsUpwards ? TEXT("up") : TEXT("down"),
+		*DescribeEndpoint(plan.Input.Endpoint),
+		*DescribeEndpoint(plan.Output.Endpoint),
+		result.InputLink,
+		result.OutputLink);
+
+	SchedulePostConstructValidation(plan, lift);
+	return result;
+}
+
+void FBlueprintVerticalConveyorConnectionManager::
+	SchedulePostConstructValidation(
+		const FBridgeFinalizationPlan& plan,
+		AFGBuildableConveyorLift* lift) const
+{
+	// The tick-group scan is diagnostic and can be proportional to factory size.
+	// Keep it out of normal gameplay unless detailed VCA logging is enabled.
+	if (!UE_LOG_ACTIVE(LogVerticalConveyorAutoConnect, Verbose) ||
+		!IsValid(lift) || !IsValid(lift->GetWorld()))
+	{
+		return;
+	}
+
+	auto makeEndpointSnapshot = [](
+		const FBridgeEndpointPlan& endpointPlan)
+	{
+		FBridgeEndpointValidationSnapshot snapshot;
+		snapshot.BridgeConnection = endpointPlan.BridgeConnection;
+		snapshot.OutsideConnection = endpointPlan.OutsideConnection;
+		snapshot.ExpectedBridgeDirection =
+			endpointPlan.ExpectedBridgeDirection;
+		snapshot.HadOutsideConnection =
+			endpointPlan.HadOutsideConnection;
+		if (endpointPlan.Endpoint.Kind ==
+			EBlueprintVerticalEndpointKind::FloorHoleSide)
+		{
+			snapshot.HadFloorHole = true;
+			snapshot.FloorHole = Cast<AFGBuildablePassthrough>(
+				endpointPlan.Endpoint.Buildable);
+			snapshot.FloorHoleSide = endpointPlan.Endpoint.Side;
+		}
+		return snapshot;
+	};
+
+	FBridgeValidationSnapshot snapshot;
+	snapshot.Lift = lift;
+	snapshot.Input = makeEndpointSnapshot(plan.Input);
+	snapshot.Output = makeEndpointSnapshot(plan.Output);
+
+	lift->GetWorldTimerManager().SetTimerForNextTick(
+		FTimerDelegate::CreateLambda([snapshot]()
+		{
+			FBlueprintVerticalConveyorConnectionManager::
+				ValidateConstructedBridgeNextTick(snapshot);
+		}));
+}
+
+void FBlueprintVerticalConveyorConnectionManager::
+	ValidateConstructedBridgeNextTick(FBridgeValidationSnapshot snapshot)
+{
+	AFGBuildableConveyorLift* lift = snapshot.Lift.Get();
+	if (!IsValid(lift))
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: post-construct audit failed reason=lift-invalid"));
+		return;
+	}
+
+	auto validateEndpoint = [](
+		const FBridgeEndpointValidationSnapshot& endpoint)
+	{
+		UFGFactoryConnectionComponent* bridgeConnection =
+			endpoint.BridgeConnection.Get();
+		UFGFactoryConnectionComponent* outsideConnection =
+			endpoint.OutsideConnection.Get();
+		if (!IsValid(bridgeConnection) ||
+			bridgeConnection->GetDirection() !=
+				endpoint.ExpectedBridgeDirection ||
+			(endpoint.HadOutsideConnection &&
+			 !IsValid(outsideConnection)))
+		{
+			return false;
+		}
+
+		if (endpoint.HadFloorHole)
+		{
+			AFGBuildablePassthrough* floorHole = endpoint.FloorHole.Get();
+			if (!IsValid(floorHole) ||
+				FBlueprintVerticalConveyorConnectionManager::
+					GetFloorHoleSnappedConnection(
+						floorHole,
+						endpoint.FloorHoleSide) != bridgeConnection ||
+				FBlueprintVerticalConveyorConnectionManager::
+					GetFloorHoleSnappedConnection(
+						floorHole,
+						FBlueprintVerticalConveyorConnectionManager::
+							OppositeSide(endpoint.FloorHoleSide)) !=
+						(endpoint.HadOutsideConnection
+							? outsideConnection
+							: nullptr))
+			{
+				return false;
+			}
+		}
+
+		if (!endpoint.HadOutsideConnection)
+		{
+			return !bridgeConnection->IsConnected() &&
+				bridgeConnection->GetConnection() == nullptr;
+		}
+
+		return IsValid(outsideConnection) &&
+			outsideConnection->GetDirection() ==
+				FBlueprintVerticalConveyorConnectionManager::
+					OppositeDirection(endpoint.ExpectedBridgeDirection) &&
+			bridgeConnection->GetConnection() == outsideConnection &&
+			outsideConnection->GetConnection() == bridgeConnection &&
+			bridgeConnection->IsConnected() &&
+			outsideConnection->IsConnected();
+	};
+
+	const bool topologyValid =
+		validateEndpoint(snapshot.Input) &&
+		validateEndpoint(snapshot.Output);
+
+	AFGBuildableSubsystem* buildableSubsystem =
+		AFGBuildableSubsystem::Get(lift);
+	int32 matchingTickGroups = 0;
+	bool matchedGroupIsPending = false;
+	AFGConveyorChainActor* tickGroupChainActor = nullptr;
+	if (IsValid(buildableSubsystem))
+	{
+		for (FConveyorTickGroup* tickGroup :
+			buildableSubsystem->mConveyorTickGroup)
+		{
+			if (tickGroup == nullptr ||
+				!tickGroup->Conveyors.ContainsByPredicate(
+					[lift](
+						const TObjectPtr<AFGBuildableConveyorBase>&
+							conveyor)
+					{
+						return conveyor.Get() == lift;
+					}))
+			{
+				continue;
+			}
+
+			++matchingTickGroups;
+			if (matchingTickGroups == 1)
+			{
+				tickGroupChainActor = tickGroup->ChainActor;
+			}
+			matchedGroupIsPending = matchedGroupIsPending ||
+				buildableSubsystem->mConveyorGroupsPendingChainActors.Contains(
+					tickGroup);
+		}
+	}
+
+	AFGConveyorChainActor* savedChainActor =
+		lift->GetConveyorChainActor();
+	const bool tickGroupMismatch = matchingTickGroups != 1 ||
+		(!matchedGroupIsPending &&
+		 tickGroupChainActor != savedChainActor);
+
+	auto getOutsideConveyor = [](
+		const FBridgeEndpointValidationSnapshot& endpoint)
+		-> AFGBuildableConveyorBase*
+	{
+		UFGFactoryConnectionComponent* outsideConnection =
+			endpoint.OutsideConnection.Get();
+		return endpoint.HadOutsideConnection && IsValid(outsideConnection)
+			? Cast<AFGBuildableConveyorBase>(outsideConnection->GetOwner())
+			: nullptr;
+	};
+	AFGBuildableConveyorBase* inputConveyor =
+		getOutsideConveyor(snapshot.Input);
+	AFGBuildableConveyorBase* outputConveyor =
+		getOutsideConveyor(snapshot.Output);
+
+	const FString audit = FString::Printf(
+		TEXT("lift=%s topology=%d bucket=%d savedChain=%s tickGroups=%d tickChain=%s tickPending=%d inputNeighbor=%s inputBucket=%d inputChain=%s outputNeighbor=%s outputBucket=%d outputChain=%s"),
+		*GetNameSafe(lift),
+		topologyValid ? 1 : 0,
+		lift->GetConveyorBucketID(),
+		*GetNameSafe(savedChainActor),
+		matchingTickGroups,
+		*GetNameSafe(tickGroupChainActor),
+		matchedGroupIsPending ? 1 : 0,
+		*GetNameSafe(inputConveyor),
+		IsValid(inputConveyor) ? inputConveyor->GetConveyorBucketID() : INDEX_NONE,
+		IsValid(inputConveyor)
+			? *GetNameSafe(inputConveyor->GetConveyorChainActor())
+			: TEXT("<none>"),
+		*GetNameSafe(outputConveyor),
+		IsValid(outputConveyor) ? outputConveyor->GetConveyorBucketID() : INDEX_NONE,
+		IsValid(outputConveyor)
+			? *GetNameSafe(outputConveyor->GetConveyorChainActor())
+			: TEXT("<none>"));
+
+	if (!topologyValid || tickGroupMismatch)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: post-construct audit failed %s"),
+			*audit);
+	}
+	else
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Verbose,
+			TEXT("VerticalConveyorAutoConnect: post-construct audit passed %s"),
+			*audit);
+	}
 }
 
 void FBlueprintVerticalConveyorConnectionManager::Construct(
@@ -2565,6 +3466,18 @@ void FBlueprintVerticalConveyorConnectionManager::Construct(
 			continue;
 		}
 
+		FBridgeFinalizationPlan finalizationPlan;
+		if (!PrepareBridgeFinalizationPlan(state, finalizationPlan))
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: final bridge preflight failed for %s -> %s; bridge was not constructed"),
+				*DescribeEndpoint(GetBlueprintEndpoint(state, true)),
+				*DescribeEndpoint(GetTargetEndpoint(state)));
+			continue;
+		}
+
 
 		TArray<AActor*> constructedChildren;
 		AFGBuildableConveyorLift* lift = Cast<AFGBuildableConveyorLift>(
@@ -2582,7 +3495,37 @@ void FBlueprintVerticalConveyorConnectionManager::Construct(
 			continue;
 		}
 
-		FinalizeConstructedBridge(state, lift);
+		const FBridgeFinalizationResult finalizationResult =
+			FinalizeConstructedBridge(
+				state,
+				finalizationPlan,
+				lift);
+		if (!finalizationResult.IsSuccess())
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Error,
+				TEXT("VerticalConveyorAutoConnect: discarding failed bridge %s status=%d inputLink=%d outputLink=%d"),
+				*GetNameSafe(lift),
+				static_cast<int32>(finalizationResult.Status),
+				finalizationResult.InputLink,
+				finalizationResult.OutputLink);
+
+			// FinalizeConstructedBridge rolls back every mutation path it reaches.
+			// Repeat the idempotent cleanup here as a last guard for failures that
+			// occurred before the constructed connection slots could be resolved.
+			RollBackBridgeFinalization(lift, finalizationPlan);
+			for (AActor* child : constructedChildren)
+			{
+				if (IsValid(child))
+				{
+					child->Destroy();
+				}
+			}
+			lift->Destroy();
+			continue;
+		}
+
 		outConstructedBridgeBuildables.Add(lift);
 		for (AActor* child : constructedChildren)
 		{
