@@ -272,6 +272,23 @@ Blueprint actors may not have run `BeginPlay()` when bridge construction occurs.
 Finalization therefore performs the required reciprocal factory connection
 linking explicitly.
 
+Finalization is transactional at the manager boundary:
+
+- before constructing the bridge, resolve both continuations and require every
+  non-bare connection to be valid, vertical, direction-compatible, and open;
+- for a blueprint-owned Floor Hole continuation, remap its owning buildable and
+  physical connection slot explicitly, then require the constructed Floor
+  Hole's saved passthrough pointer to agree with that mapping;
+- after construction, revalidate both endpoints before calling `SetConnection`
+  on either side;
+- expected bare Floor Hole endpoints remain valid and produce link result `-1`;
+- any real link conflict, non-reciprocal result, or failed post-condition rolls
+  back bridge-owned connection/snap state and rejects the fresh bridge actor.
+
+Do not attempt to repair conveyor chains directly from this manager. The
+next-tick audit reads bucket and chain ownership for diagnosis, but chain
+invalidation and rebuilding remain owned by the game subsystem.
+
 For generated lifts, do not assume `GetConnection0()` is always transport input
 and `GetConnection1()` output. Attachment-first placement can reverse physical
 slot order. Resolve input/output from the constructed component directions and

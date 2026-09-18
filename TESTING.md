@@ -142,6 +142,33 @@ Before a public release:
 5. if server targets will be advertised, test the packaged Windows/Linux
    dedicated-server targets that will be enabled.
 
+## Finalization and persistence hardening
+
+With `LogVerticalConveyorAutoConnect=Verbose`, every successful generated bridge
+must log all three stages:
+
+1. `bridge preflight accepted`;
+2. `finalized` with each continuing side reported as `1` and each intentionally
+   bare Floor Hole side reported as `-1`;
+3. `post-construct audit passed` on the following tick.
+
+Run the full U/D matrix and specifically repeat Floor Hole ↔ Floor Hole with:
+
+- continuations on both sides;
+- a bare source side and a continuing target side;
+- a continuing source side and a bare target side;
+- at least six bridges constructed by one stacked-blueprint placement.
+
+For the multi-bridge case, save immediately after placement, quit to desktop,
+reload, and verify flow. Repeat after allowing conveyor chains to run for at
+least one autosave interval. Then save, disable the mod, reload, and verify the
+generated vanilla lifts again.
+
+A deliberately stale or conflicting seam must fail before bridge construction
+with a specific `bridge preflight rejected` reason. It must not leave a generated
+lift or change either existing continuation. Any `post-construct audit failed`
+line is a regression artifact and should be retained with the save/log.
+
 ## Diagnostic logging
 
 Normal warnings are always useful in bug reports.

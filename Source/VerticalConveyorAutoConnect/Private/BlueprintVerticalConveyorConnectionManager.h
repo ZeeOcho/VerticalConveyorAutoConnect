@@ -74,6 +74,15 @@ private:
 	{
 		AFGBuildable* BlueprintBuildable = nullptr;
 		AFGBuildable* ConstructedBlueprintBuildable = nullptr;
+		// A Floor Hole endpoint can obtain its lift tier and transport direction
+		// from a continuation inside the blueprint. Keep an explicit locator for
+		// that component so final construction can verify the Floor Hole's saved
+		// passthrough pointer was remapped to the intended constructed lift.
+		bool BlueprintContinuationWasPresent = false;
+		int32 BlueprintContinuationBuildableIndex = INDEX_NONE;
+		int32 BlueprintContinuationConnectionIndex = INDEX_NONE;
+		TObjectPtr<UFGFactoryConnectionComponent>
+			ConstructedBlueprintContinuationConnection = nullptr;
 		TObjectPtr<AFGBuildable> TargetBuildable = nullptr;
 		TObjectPtr<AFGConveyorLiftHologram> BridgeHologram = nullptr;
 		TSubclassOf<UFGRecipe> LiftRecipe;
@@ -173,6 +182,70 @@ private:
 	{
 		UFGFactoryConnectionComponent* Bottom = nullptr;
 		UFGFactoryConnectionComponent* Top = nullptr;
+	};
+
+	enum class EBridgeFinalizationStatus : uint8
+	{
+		Succeeded,
+		InvalidLift,
+		LiftStateMismatch,
+		EndpointChanged,
+		LinkRejected,
+		PostConditionFailed
+	};
+
+	struct FBridgeEndpointPlan
+	{
+		FEndpointRef Endpoint;
+		UFGFactoryConnectionComponent* OutsideConnection = nullptr;
+		UFGFactoryConnectionComponent* BridgeConnection = nullptr;
+		EFactoryConnectionDirection ExpectedBridgeDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		EFactoryConnectionDirection OriginalOutsideDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		bool HadOutsideConnection = false;
+		bool WasAlreadyLinked = false;
+		bool ChangedOutsideDirection = false;
+	};
+
+	struct FBridgeFinalizationPlan
+	{
+		FBridgeEndpointPlan Input;
+		FBridgeEndpointPlan Output;
+		bool ExpectedFlowsUpwards = false;
+	};
+
+	struct FBridgeFinalizationResult
+	{
+		EBridgeFinalizationStatus Status =
+			EBridgeFinalizationStatus::InvalidLift;
+		int32 InputLink = 0;
+		int32 OutputLink = 0;
+
+		bool IsSuccess() const
+		{
+			return Status == EBridgeFinalizationStatus::Succeeded;
+		}
+	};
+
+	struct FBridgeEndpointValidationSnapshot
+	{
+		TWeakObjectPtr<UFGFactoryConnectionComponent> BridgeConnection;
+		TWeakObjectPtr<UFGFactoryConnectionComponent> OutsideConnection;
+		TWeakObjectPtr<AFGBuildablePassthrough> FloorHole;
+		EBlueprintVerticalEndpointSide FloorHoleSide =
+			EBlueprintVerticalEndpointSide::Top;
+		EFactoryConnectionDirection ExpectedBridgeDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		bool HadOutsideConnection = false;
+		bool HadFloorHole = false;
+	};
+
+	struct FBridgeValidationSnapshot
+	{
+		TWeakObjectPtr<AFGBuildableConveyorLift> Lift;
+		FBridgeEndpointValidationSnapshot Input;
+		FBridgeEndpointValidationSnapshot Output;
 	};
 
 	TArray<FConnectionState> ConnectionStates;
@@ -308,13 +381,39 @@ private:
 		bool& outCanDirectlyConnect) const;
 
 	void ConnectDirectly(FConnectionState& state);
-	void FinalizeConstructedBridge(
+	bool PrepareBridgeFinalizationPlan(
 		FConnectionState& state,
-		AFGBuildableConveyorLift* lift) const;
-	int32 ConnectBridgeEndpoint(
+		FBridgeFinalizationPlan& outPlan) const;
+	bool PreflightBridgeEndpointBeforeConstruct(
+		const FConnectionState& state,
+		const TCHAR* endpointName,
+		FBridgeEndpointPlan& endpointPlan) const;
+	bool PrepareConstructedBridgeEndpoint(
 		AFGBuildableConveyorLift* lift,
 		const TCHAR* endpointName,
 		UFGFactoryConnectionComponent* bridgeConnection,
-		UFGFactoryConnectionComponent* outsideConnection,
-		const FEndpointRef& endpoint) const;
+		FBridgeEndpointPlan& endpointPlan) const;
+	bool ApplyBridgeEndpointBookkeeping(
+		AFGBuildableConveyorLift* lift,
+		const TCHAR* endpointName,
+		FBridgeEndpointPlan& endpointPlan) const;
+	int32 ConnectBridgeEndpoint(
+		AFGBuildableConveyorLift* lift,
+		const TCHAR* endpointName,
+		FBridgeEndpointPlan& endpointPlan) const;
+	bool ValidateBridgeEndpointPostCondition(
+		const TCHAR* endpointName,
+		const FBridgeEndpointPlan& endpointPlan) const;
+	void RollBackBridgeFinalization(
+		AFGBuildableConveyorLift* lift,
+		FBridgeFinalizationPlan& plan) const;
+	FBridgeFinalizationResult FinalizeConstructedBridge(
+		FConnectionState& state,
+		FBridgeFinalizationPlan& plan,
+		AFGBuildableConveyorLift* lift) const;
+	void SchedulePostConstructValidation(
+		const FBridgeFinalizationPlan& plan,
+		AFGBuildableConveyorLift* lift) const;
+	static void ValidateConstructedBridgeNextTick(
+		FBridgeValidationSnapshot snapshot);
 };
