@@ -285,6 +285,16 @@ Finalization is transactional at the manager boundary:
 - any real link conflict, non-reciprocal result, or failed post-condition rolls
   back bridge-owned connection/snap state and rejects the fresh bridge actor.
 
+A coincident pair takes the direct path and creates no bridge actor, but it must
+follow the same discipline. Preview resolves and serializes a concrete direction
+for each connection. Final construction then rechecks exact geometry, verifies
+the blueprint Floor Hole continuation against its explicit buildable/connection
+remap, restores a blueprint attachment's persisted pre-`BeginPlay` direction,
+and rejects conflicting or partially reciprocal connection state. Both Floor
+Hole backreferences are staged before `SetConnection()`. Any failed reciprocal
+or bookkeeping post-condition restores the original backreferences and
+directions and clears only the link created by that transaction.
+
 Do not attempt to repair conveyor chains directly from this manager. The
 next-tick audit reads bucket and chain ownership for diagnosis, but chain
 invalidation and rebuilding remain owned by the game subsystem.
@@ -304,6 +314,7 @@ construction:
 - target buildable/kind/side/connection identity;
 - lift recipe;
 - normalized lower-endpoint direction;
+- preview-resolved blueprint/target directions for a direct connection;
 - snap/direct-connect state.
 
 `PostConstructMessageDeserialization()` reconstructs the preview child from that

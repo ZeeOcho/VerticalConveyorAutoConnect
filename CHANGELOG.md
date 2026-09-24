@@ -4,6 +4,28 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-09-22
+
+### Fixed
+
+- Coincident/direct blueprint seam connections now receive final geometry,
+  continuation-remap, connection-state, and transport-direction validation
+  after the blueprint actors have been constructed.
+- Direct connection finalization is transactional: Floor Hole bookkeeping,
+  temporary direction restoration, and a newly created reciprocal link are
+  rolled back when any immediate post-condition fails.
+- Blueprint-owned attachment ports in the direct path now restore and verify
+  their persisted pre-`BeginPlay` transport role, matching generated bridges.
+- Plugin version metadata now reports `1.0.4` instead of the stale `1.0.2`.
+
+### Diagnostics
+
+- Added explicit direct preflight/finalization reasons and a verbose next-tick
+  audit of reciprocal links, Floor Hole backreferences, conveyor buckets, and
+  saved/tick-group chain ownership.
+
+## [1.0.3] - 2026-09-18
+
 ### Fixed
 
 - Generated Conveyor Lift finalization now preflights both endpoints before the
