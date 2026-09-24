@@ -102,6 +102,13 @@ private:
 		// construction must not rediscover an already-locked direction.
 		EFactoryConnectionDirection ResolvedLowerEndpointDirection =
 			EFactoryConnectionDirection::FCD_ANY;
+		// A coincident endpoint pair bypasses bridge construction, but it still
+		// needs deterministic transport roles after the blueprint actors are
+		// remapped. Preserve the preview-resolved pair for final validation.
+		EFactoryConnectionDirection DirectBlueprintConnectionDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		EFactoryConnectionDirection DirectTargetConnectionDirection =
+			EFactoryConnectionDirection::FCD_ANY;
 		bool HasSnappedTarget = false;
 		bool CanDirectlyConnect = false;
 		bool IsValid = false;
@@ -145,6 +152,21 @@ private:
 					static_cast<EFactoryConnectionDirection>(resolvedLowerDirection);
 			}
 
+			uint8 directBlueprintDirection =
+				static_cast<uint8>(state.DirectBlueprintConnectionDirection);
+			uint8 directTargetDirection =
+				static_cast<uint8>(state.DirectTargetConnectionDirection);
+			archive << directBlueprintDirection;
+			archive << directTargetDirection;
+			if (archive.IsLoading())
+			{
+				state.DirectBlueprintConnectionDirection =
+					static_cast<EFactoryConnectionDirection>(
+						directBlueprintDirection);
+				state.DirectTargetConnectionDirection =
+					static_cast<EFactoryConnectionDirection>(directTargetDirection);
+			}
+
 			archive << state.HasSnappedTarget;
 			archive << state.CanDirectlyConnect;
 			return archive;
@@ -182,6 +204,47 @@ private:
 	{
 		UFGFactoryConnectionComponent* Bottom = nullptr;
 		UFGFactoryConnectionComponent* Top = nullptr;
+	};
+
+	struct FDirectConnectionPlan
+	{
+		FEndpointRef BlueprintEndpoint;
+		FEndpointRef TargetEndpoint;
+		UFGFactoryConnectionComponent* BlueprintConnection = nullptr;
+		UFGFactoryConnectionComponent* TargetConnection = nullptr;
+		UFGFactoryConnectionComponent* OriginalBlueprintExposedConnection = nullptr;
+		UFGFactoryConnectionComponent* OriginalTargetExposedConnection = nullptr;
+		EFactoryConnectionDirection ExpectedBlueprintDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		EFactoryConnectionDirection ExpectedTargetDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		EFactoryConnectionDirection OriginalBlueprintDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		EFactoryConnectionDirection OriginalTargetDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		bool WasAlreadyLinked = false;
+		bool CreatedLink = false;
+		bool ChangedBlueprintDirection = false;
+		bool ChangedTargetDirection = false;
+		bool ChangedBlueprintBookkeeping = false;
+		bool ChangedTargetBookkeeping = false;
+	};
+
+	struct FDirectEndpointValidationSnapshot
+	{
+		TWeakObjectPtr<UFGFactoryConnectionComponent> Connection;
+		TWeakObjectPtr<AFGBuildablePassthrough> FloorHole;
+		EBlueprintVerticalEndpointSide FloorHoleSide =
+			EBlueprintVerticalEndpointSide::Top;
+		EFactoryConnectionDirection ExpectedDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		bool HadFloorHole = false;
+	};
+
+	struct FDirectValidationSnapshot
+	{
+		FDirectEndpointValidationSnapshot Blueprint;
+		FDirectEndpointValidationSnapshot Target;
 	};
 
 	enum class EBridgeFinalizationStatus : uint8
@@ -380,7 +443,23 @@ private:
 		float& outVerticalDistance,
 		bool& outCanDirectlyConnect) const;
 
-	void ConnectDirectly(FConnectionState& state);
+	static bool ResolveDirectConnectionDirections(
+		const UFGFactoryConnectionComponent* blueprintConnection,
+		const UFGFactoryConnectionComponent* targetConnection,
+		EFactoryConnectionDirection& outBlueprintDirection,
+		EFactoryConnectionDirection& outTargetDirection);
+	bool PrepareDirectConnectionPlan(
+		const FConnectionState& state,
+		FDirectConnectionPlan& outPlan) const;
+	bool ApplyDirectConnectionBookkeeping(FDirectConnectionPlan& plan) const;
+	bool ValidateDirectConnectionPostCondition(
+		const FDirectConnectionPlan& plan) const;
+	void RollBackDirectConnection(FDirectConnectionPlan& plan) const;
+	bool ConnectDirectly(const FConnectionState& state) const;
+	void ScheduleDirectConnectionValidation(
+		const FDirectConnectionPlan& plan) const;
+	static void ValidateDirectConnectionNextTick(
+		FDirectValidationSnapshot snapshot);
 	bool PrepareBridgeFinalizationPlan(
 		FConnectionState& state,
 		FBridgeFinalizationPlan& outPlan) const;

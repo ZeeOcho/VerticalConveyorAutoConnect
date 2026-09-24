@@ -120,6 +120,45 @@ FBlueprintVerticalConveyorConnectionManager::OppositeDirection(
 	}
 }
 
+bool FBlueprintVerticalConveyorConnectionManager::
+	ResolveDirectConnectionDirections(
+		const UFGFactoryConnectionComponent* blueprintConnection,
+		const UFGFactoryConnectionComponent* targetConnection,
+		EFactoryConnectionDirection& outBlueprintDirection,
+		EFactoryConnectionDirection& outTargetDirection)
+{
+	outBlueprintDirection = EFactoryConnectionDirection::FCD_ANY;
+	outTargetDirection = EFactoryConnectionDirection::FCD_ANY;
+	if (!IsValid(blueprintConnection) || !IsValid(targetConnection))
+	{
+		return false;
+	}
+
+	const auto isTransportDirection = [](EFactoryConnectionDirection direction)
+	{
+		return direction == EFactoryConnectionDirection::FCD_INPUT ||
+			direction == EFactoryConnectionDirection::FCD_OUTPUT;
+	};
+
+	outBlueprintDirection = blueprintConnection->GetDirection();
+	outTargetDirection = targetConnection->GetDirection();
+	if (!isTransportDirection(outBlueprintDirection) &&
+		!isTransportDirection(outTargetDirection))
+	{
+		return false;
+	}
+	if (!isTransportDirection(outBlueprintDirection))
+	{
+		outBlueprintDirection = OppositeDirection(outTargetDirection);
+	}
+	if (!isTransportDirection(outTargetDirection))
+	{
+		outTargetDirection = OppositeDirection(outBlueprintDirection);
+	}
+
+	return OppositeDirection(outBlueprintDirection) == outTargetDirection;
+}
+
 UFGFactoryConnectionComponent*
 FBlueprintVerticalConveyorConnectionManager::GetFloorHoleSnappedConnection(
 	const AFGBuildablePassthrough* hole,
@@ -1660,6 +1699,10 @@ void FBlueprintVerticalConveyorConnectionManager::ClearTarget(
 	state.TargetSide = EBlueprintVerticalEndpointSide::Bottom;
 	state.ResolvedLowerEndpointDirection =
 		EFactoryConnectionDirection::FCD_ANY;
+	state.DirectBlueprintConnectionDirection =
+		EFactoryConnectionDirection::FCD_ANY;
+	state.DirectTargetConnectionDirection =
+		EFactoryConnectionDirection::FCD_ANY;
 	state.CanDirectlyConnect = false;
 	state.IsValid = false;
 }
@@ -1959,17 +2002,32 @@ void FBlueprintVerticalConveyorConnectionManager::FindBestTarget(
 
 		EFactoryConnectionDirection resolvedLowerDirection =
 			EFactoryConnectionDirection::FCD_ANY;
+		EFactoryConnectionDirection directBlueprintDirection =
+			EFactoryConnectionDirection::FCD_ANY;
+		EFactoryConnectionDirection directTargetDirection =
+			EFactoryConnectionDirection::FCD_ANY;
 		if (physical.CanDirectlyConnect)
 		{
 			UFGFactoryConnectionComponent* first =
 				GetTransportConnectionAcrossEndpoint(blueprintEndpoint);
 			UFGFactoryConnectionComponent* second =
 				GetTransportConnectionAcrossEndpoint(targetEndpoint);
-			if (!IsValid(first) || !IsValid(second) ||
-				(first->GetConnection() != second &&
-					(first->IsConnected() || second->IsConnected() ||
-						(!first->CanConnectTo(second) &&
-						 !second->CanConnectTo(first)))))
+			const bool isReciprocal = IsValid(first) && IsValid(second) &&
+				first->GetConnection() == second &&
+				second->GetConnection() == first &&
+				first->IsConnected() && second->IsConnected();
+			const bool isFresh = IsValid(first) && IsValid(second) &&
+				first->GetConnection() == nullptr &&
+				second->GetConnection() == nullptr &&
+				!first->IsConnected() && !second->IsConnected();
+			if ((!isReciprocal && !isFresh) ||
+				!ResolveDirectConnectionDirections(
+					first,
+					second,
+					directBlueprintDirection,
+					directTargetDirection) ||
+				(isFresh && !first->CanConnectTo(second) &&
+				 !second->CanConnectTo(first)))
 			{
 				continue;
 			}
@@ -1997,6 +2055,8 @@ void FBlueprintVerticalConveyorConnectionManager::FindBestTarget(
 		state.TargetSide = targetEndpoint.Side;
 		state.TargetConnectionName = targetEndpoint.ConnectionName;
 		state.ResolvedLowerEndpointDirection = resolvedLowerDirection;
+		state.DirectBlueprintConnectionDirection = directBlueprintDirection;
+		state.DirectTargetConnectionDirection = directTargetDirection;
 		state.CanDirectlyConnect = physical.CanDirectlyConnect;
 
 		if (physical.CanDirectlyConnect)
@@ -2307,55 +2367,546 @@ void FBlueprintVerticalConveyorConnectionManager::
 	}
 }
 
-void FBlueprintVerticalConveyorConnectionManager::ConnectDirectly(
-	FConnectionState& state)
+bool FBlueprintVerticalConveyorConnectionManager::PrepareDirectConnectionPlan(
+	const FConnectionState& state,
+	FDirectConnectionPlan& outPlan) const
 {
-	const FEndpointRef blueprintEndpoint = GetBlueprintEndpoint(state, true);
-	const FEndpointRef targetEndpoint = GetTargetEndpoint(state);
-	UFGFactoryConnectionComponent* blueprintConnection =
-		GetTransportConnectionAcrossEndpoint(blueprintEndpoint);
-	UFGFactoryConnectionComponent* targetConnection =
-		GetTransportConnectionAcrossEndpoint(targetEndpoint);
-	if (!IsValid(blueprintConnection) || !IsValid(targetConnection))
+	outPlan = {};
+	outPlan.BlueprintEndpoint = GetBlueprintEndpoint(state, true);
+	outPlan.TargetEndpoint = GetTargetEndpoint(state);
+	outPlan.ExpectedBlueprintDirection =
+		state.DirectBlueprintConnectionDirection;
+	outPlan.ExpectedTargetDirection = state.DirectTargetConnectionDirection;
+
+	const auto isTransportDirection = [](EFactoryConnectionDirection direction)
 	{
-		return;
+		return direction == EFactoryConnectionDirection::FCD_INPUT ||
+			direction == EFactoryConnectionDirection::FCD_OUTPUT;
+	};
+	if (!IsValid(outPlan.BlueprintEndpoint.Buildable) ||
+		!IsValid(outPlan.TargetEndpoint.Buildable) ||
+		!isTransportDirection(outPlan.ExpectedBlueprintDirection) ||
+		!isTransportDirection(outPlan.ExpectedTargetDirection) ||
+		OppositeDirection(outPlan.ExpectedBlueprintDirection) !=
+			outPlan.ExpectedTargetDirection)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=invalid-endpoint-or-locked-direction source=%s target=%s sourceDirection=%d targetDirection=%d"),
+			*DescribeEndpoint(outPlan.BlueprintEndpoint),
+			*DescribeEndpoint(outPlan.TargetEndpoint),
+			static_cast<int32>(outPlan.ExpectedBlueprintDirection),
+			static_cast<int32>(outPlan.ExpectedTargetDirection));
+		return false;
 	}
 
-	if (blueprintConnection->GetConnection() != targetConnection)
+	float verticalDistance = 0.0f;
+	bool canDirectlyConnect = false;
+	if (!IsGeometricallyCompatible(
+			outPlan.BlueprintEndpoint,
+			outPlan.TargetEndpoint,
+			verticalDistance,
+			canDirectlyConnect) ||
+		!canDirectlyConnect)
 	{
-		if (blueprintConnection->IsConnected() || targetConnection->IsConnected())
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=final-geometry-changed source=%s sourceLocation=%s target=%s targetLocation=%s distance=%.6f"),
+			*DescribeEndpoint(outPlan.BlueprintEndpoint),
+			*GetEndpointWorldTransform(outPlan.BlueprintEndpoint)
+				.GetLocation()
+				.ToString(),
+			*DescribeEndpoint(outPlan.TargetEndpoint),
+			*GetEndpointWorldTransform(outPlan.TargetEndpoint)
+				.GetLocation()
+				.ToString(),
+			verticalDistance);
+		return false;
+	}
+
+	outPlan.BlueprintConnection =
+		GetTransportConnectionAcrossEndpoint(outPlan.BlueprintEndpoint);
+	outPlan.TargetConnection =
+		GetTransportConnectionAcrossEndpoint(outPlan.TargetEndpoint);
+	if (!IsValid(outPlan.BlueprintConnection) ||
+		!IsValid(outPlan.TargetConnection) ||
+		outPlan.BlueprintConnection == outPlan.TargetConnection)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=missing-or-shared-connection source=%s sourceConnection=%s target=%s targetConnection=%s"),
+			*DescribeEndpoint(outPlan.BlueprintEndpoint),
+			*GetNameSafe(outPlan.BlueprintConnection),
+			*DescribeEndpoint(outPlan.TargetEndpoint),
+			*GetNameSafe(outPlan.TargetConnection));
+		return false;
+	}
+
+	auto captureFloorHole = [this](
+		const TCHAR* endpointName,
+		const FEndpointRef& endpoint,
+		UFGFactoryConnectionComponent*& outExposedConnection)
+	{
+		outExposedConnection = nullptr;
+		if (endpoint.Kind != EBlueprintVerticalEndpointKind::FloorHoleSide)
+		{
+			return true;
+		}
+
+		AFGBuildablePassthrough* floorHole =
+			Cast<AFGBuildablePassthrough>(endpoint.Buildable);
+		UFGFactoryConnectionComponent* continuation =
+			GetTransportConnectionAcrossEndpoint(endpoint);
+		AFGBuildableConveyorLift* continuationLift = IsValid(continuation)
+			? Cast<AFGBuildableConveyorLift>(continuation->GetOwner())
+			: nullptr;
+		if (!IsConveyorFloorHole(floorHole) ||
+			!IsValid(continuationLift) ||
+			(continuation != continuationLift->GetConnection0() &&
+			 continuation != continuationLift->GetConnection1()))
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: direct preflight rejected endpoint=%s reason=invalid-floor-hole-continuation floorHole=%s continuation=%s owner=%s"),
+				endpointName,
+				*GetNameSafe(floorHole),
+				*GetNameSafe(continuation),
+				IsValid(continuation)
+					? *GetNameSafe(continuation->GetOwner())
+					: TEXT("<none>"));
+			return false;
+		}
+
+		outExposedConnection =
+			GetFloorHoleSnappedConnection(floorHole, endpoint.Side);
+		return true;
+	};
+	if (!captureFloorHole(
+			TEXT("source"),
+			outPlan.BlueprintEndpoint,
+			outPlan.OriginalBlueprintExposedConnection) ||
+		!captureFloorHole(
+			TEXT("target"),
+			outPlan.TargetEndpoint,
+			outPlan.OriginalTargetExposedConnection))
+	{
+		return false;
+	}
+
+	if (outPlan.BlueprintEndpoint.Kind ==
+			EBlueprintVerticalEndpointKind::FloorHoleSide &&
+		(!state.BlueprintContinuationWasPresent ||
+		 state.BlueprintContinuationBuildableIndex == INDEX_NONE ||
+		 !IsValid(state.ConstructedBlueprintContinuationConnection) ||
+		 outPlan.BlueprintConnection !=
+			 state.ConstructedBlueprintContinuationConnection))
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=source-continuation-remap-mismatch source=%s floorHoleTo=%s remapped=%s sourceIndex=%d connectionIndex=%d"),
+			*DescribeEndpoint(outPlan.BlueprintEndpoint),
+			*GetNameSafe(outPlan.BlueprintConnection),
+			*GetNameSafe(state.ConstructedBlueprintContinuationConnection),
+			state.BlueprintContinuationBuildableIndex,
+			state.BlueprintContinuationConnectionIndex);
+		return false;
+	}
+
+	UFGFactoryConnectionComponent* blueprintPeer =
+		outPlan.BlueprintConnection->GetConnection();
+	UFGFactoryConnectionComponent* targetPeer =
+		outPlan.TargetConnection->GetConnection();
+	const bool isReciprocal = blueprintPeer == outPlan.TargetConnection &&
+		targetPeer == outPlan.BlueprintConnection;
+	const bool isFresh = blueprintPeer == nullptr && targetPeer == nullptr &&
+		!outPlan.BlueprintConnection->IsConnected() &&
+		!outPlan.TargetConnection->IsConnected();
+	if (isReciprocal)
+	{
+		if (!outPlan.BlueprintConnection->IsConnected() ||
+			!outPlan.TargetConnection->IsConnected())
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=reciprocal-pointer-flag-mismatch sourceConnected=%d targetConnected=%d"),
+				outPlan.BlueprintConnection->IsConnected() ? 1 : 0,
+				outPlan.TargetConnection->IsConnected() ? 1 : 0);
+			return false;
+		}
+		outPlan.WasAlreadyLinked = true;
+	}
+	else if (!isFresh)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=non-reciprocal-or-conflicting-link source=%s sourceTo=%s sourceConnected=%d target=%s targetTo=%s targetConnected=%d"),
+			*GetNameSafe(outPlan.BlueprintConnection),
+			*GetNameSafe(blueprintPeer),
+			outPlan.BlueprintConnection->IsConnected() ? 1 : 0,
+			*GetNameSafe(outPlan.TargetConnection),
+			*GetNameSafe(targetPeer),
+			outPlan.TargetConnection->IsConnected() ? 1 : 0);
+		return false;
+	}
+
+	const UFGFactoryConnectionComponent* expectedBlueprintExposed =
+		outPlan.WasAlreadyLinked ? outPlan.TargetConnection : nullptr;
+	const UFGFactoryConnectionComponent* expectedTargetExposed =
+		outPlan.WasAlreadyLinked ? outPlan.BlueprintConnection : nullptr;
+	if ((outPlan.BlueprintEndpoint.Kind ==
+			 EBlueprintVerticalEndpointKind::FloorHoleSide &&
+		 outPlan.OriginalBlueprintExposedConnection !=
+			 expectedBlueprintExposed) ||
+		(outPlan.TargetEndpoint.Kind ==
+			 EBlueprintVerticalEndpointKind::FloorHoleSide &&
+		 outPlan.OriginalTargetExposedConnection != expectedTargetExposed))
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=floor-hole-exposed-side-changed sourceExposed=%s expectedSource=%s targetExposed=%s expectedTarget=%s"),
+			*GetNameSafe(outPlan.OriginalBlueprintExposedConnection),
+			*GetNameSafe(expectedBlueprintExposed),
+			*GetNameSafe(outPlan.OriginalTargetExposedConnection),
+			*GetNameSafe(expectedTargetExposed));
+		return false;
+	}
+
+	outPlan.OriginalBlueprintDirection =
+		outPlan.BlueprintConnection->GetDirection();
+	outPlan.OriginalTargetDirection = outPlan.TargetConnection->GetDirection();
+	if (!outPlan.WasAlreadyLinked &&
+		outPlan.BlueprintEndpoint.Kind ==
+			EBlueprintVerticalEndpointKind::AttachmentPort)
+	{
+		if (!RestorePersistedAttachmentDirectionBeforeConstruct(
+				outPlan.BlueprintEndpoint,
+				outPlan.ExpectedBlueprintDirection))
+		{
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=source-attachment-direction-restore-failed source=%s expected=%d"),
+				*DescribeEndpoint(outPlan.BlueprintEndpoint),
+				static_cast<int32>(outPlan.ExpectedBlueprintDirection));
+			return false;
+		}
+		outPlan.ChangedBlueprintDirection =
+			outPlan.BlueprintConnection->GetDirection() !=
+				outPlan.OriginalBlueprintDirection;
+	}
+
+	const auto directionMatches = [](
+		EFactoryConnectionDirection actual,
+		EFactoryConnectionDirection expected)
+	{
+		return actual == EFactoryConnectionDirection::FCD_ANY ||
+			actual == expected;
+	};
+	if (!directionMatches(
+			outPlan.BlueprintConnection->GetDirection(),
+			outPlan.ExpectedBlueprintDirection) ||
+		!directionMatches(
+			outPlan.TargetConnection->GetDirection(),
+			outPlan.ExpectedTargetDirection) ||
+		(outPlan.WasAlreadyLinked &&
+		 (outPlan.BlueprintConnection->GetDirection() !=
+			  outPlan.ExpectedBlueprintDirection ||
+		  outPlan.TargetConnection->GetDirection() !=
+			  outPlan.ExpectedTargetDirection)))
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct preflight rejected reason=direction-changed source=%s actualSource=%d expectedSource=%d target=%s actualTarget=%d expectedTarget=%d"),
+			*GetNameSafe(outPlan.BlueprintConnection),
+			static_cast<int32>(outPlan.BlueprintConnection->GetDirection()),
+			static_cast<int32>(outPlan.ExpectedBlueprintDirection),
+			*GetNameSafe(outPlan.TargetConnection),
+			static_cast<int32>(outPlan.TargetConnection->GetDirection()),
+			static_cast<int32>(outPlan.ExpectedTargetDirection));
+		return false;
+	}
+
+	UE_LOG(
+		LogVerticalConveyorAutoConnect,
+		Verbose,
+		TEXT("VerticalConveyorAutoConnect: direct preflight accepted source=%s sourceConnection=%s sourceDirection=%d target=%s targetConnection=%s targetDirection=%d alreadyLinked=%d"),
+		*DescribeEndpoint(outPlan.BlueprintEndpoint),
+		*GetNameSafe(outPlan.BlueprintConnection),
+		static_cast<int32>(outPlan.ExpectedBlueprintDirection),
+		*DescribeEndpoint(outPlan.TargetEndpoint),
+		*GetNameSafe(outPlan.TargetConnection),
+		static_cast<int32>(outPlan.ExpectedTargetDirection),
+		outPlan.WasAlreadyLinked ? 1 : 0);
+	return true;
+}
+
+bool FBlueprintVerticalConveyorConnectionManager::
+	ApplyDirectConnectionBookkeeping(FDirectConnectionPlan& plan) const
+{
+	if (plan.WasAlreadyLinked)
+	{
+		return true;
+	}
+	if (!IsValid(plan.BlueprintConnection) ||
+		!IsValid(plan.TargetConnection) ||
+		GetTransportConnectionAcrossEndpoint(plan.BlueprintEndpoint) !=
+			plan.BlueprintConnection ||
+		GetTransportConnectionAcrossEndpoint(plan.TargetEndpoint) !=
+			plan.TargetConnection)
+	{
+		return false;
+	}
+
+	if (plan.BlueprintConnection->GetDirection() ==
+		EFactoryConnectionDirection::FCD_ANY)
+	{
+		plan.BlueprintConnection->SetDirection(plan.ExpectedBlueprintDirection);
+		plan.ChangedBlueprintDirection = true;
+	}
+	if (plan.TargetConnection->GetDirection() ==
+		EFactoryConnectionDirection::FCD_ANY)
+	{
+		plan.TargetConnection->SetDirection(plan.ExpectedTargetDirection);
+		plan.ChangedTargetDirection = true;
+	}
+	if (plan.BlueprintConnection->GetDirection() !=
+			plan.ExpectedBlueprintDirection ||
+		plan.TargetConnection->GetDirection() != plan.ExpectedTargetDirection ||
+		(!plan.BlueprintConnection->CanConnectTo(plan.TargetConnection) &&
+		 !plan.TargetConnection->CanConnectTo(plan.BlueprintConnection)))
+	{
+		return false;
+	}
+
+	auto applyFloorHole = [this](
+		const FEndpointRef& endpoint,
+		UFGFactoryConnectionComponent* expectedConnection,
+		UFGFactoryConnectionComponent* originalConnection,
+		bool& outChanged)
+	{
+		outChanged = false;
+		if (endpoint.Kind != EBlueprintVerticalEndpointKind::FloorHoleSide)
+		{
+			return true;
+		}
+
+		AFGBuildablePassthrough* floorHole =
+			Cast<AFGBuildablePassthrough>(endpoint.Buildable);
+		if (!IsConveyorFloorHole(floorHole) || originalConnection != nullptr ||
+			GetFloorHoleSnappedConnection(floorHole, endpoint.Side) !=
+				originalConnection)
+		{
+			return false;
+		}
+
+		SetFloorHoleSnappedConnection(
+			floorHole,
+			endpoint.Side,
+			expectedConnection);
+		outChanged = true;
+		return GetFloorHoleSnappedConnection(floorHole, endpoint.Side) ==
+			expectedConnection;
+	};
+
+	return applyFloorHole(
+			plan.BlueprintEndpoint,
+			plan.TargetConnection,
+			plan.OriginalBlueprintExposedConnection,
+			plan.ChangedBlueprintBookkeeping) &&
+		applyFloorHole(
+			plan.TargetEndpoint,
+			plan.BlueprintConnection,
+			plan.OriginalTargetExposedConnection,
+			plan.ChangedTargetBookkeeping);
+}
+
+bool FBlueprintVerticalConveyorConnectionManager::
+	ValidateDirectConnectionPostCondition(
+		const FDirectConnectionPlan& plan) const
+{
+	bool isValid = IsValid(plan.BlueprintConnection) &&
+		IsValid(plan.TargetConnection) &&
+		plan.BlueprintConnection->GetDirection() ==
+			plan.ExpectedBlueprintDirection &&
+		plan.TargetConnection->GetDirection() == plan.ExpectedTargetDirection &&
+		plan.BlueprintConnection->GetConnection() == plan.TargetConnection &&
+		plan.TargetConnection->GetConnection() == plan.BlueprintConnection &&
+		plan.BlueprintConnection->IsConnected() &&
+		plan.TargetConnection->IsConnected() &&
+		GetTransportConnectionAcrossEndpoint(plan.BlueprintEndpoint) ==
+			plan.BlueprintConnection &&
+		GetTransportConnectionAcrossEndpoint(plan.TargetEndpoint) ==
+			plan.TargetConnection;
+
+	if (isValid && plan.BlueprintEndpoint.Kind ==
+		EBlueprintVerticalEndpointKind::FloorHoleSide)
+	{
+		isValid = GetFloorHoleSnappedConnection(
+			Cast<AFGBuildablePassthrough>(plan.BlueprintEndpoint.Buildable),
+			plan.BlueprintEndpoint.Side) == plan.TargetConnection;
+	}
+	if (isValid && plan.TargetEndpoint.Kind ==
+		EBlueprintVerticalEndpointKind::FloorHoleSide)
+	{
+		isValid = GetFloorHoleSnappedConnection(
+			Cast<AFGBuildablePassthrough>(plan.TargetEndpoint.Buildable),
+			plan.TargetEndpoint.Side) == plan.BlueprintConnection;
+	}
+
+	if (!isValid)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct post-condition failed source=%s sourceTo=%s sourceConnected=%d target=%s targetTo=%s targetConnected=%d"),
+			*GetNameSafe(plan.BlueprintConnection),
+			IsValid(plan.BlueprintConnection)
+				? *GetNameSafe(plan.BlueprintConnection->GetConnection())
+				: TEXT("<invalid>"),
+			IsValid(plan.BlueprintConnection) &&
+				plan.BlueprintConnection->IsConnected()
+				? 1
+				: 0,
+			*GetNameSafe(plan.TargetConnection),
+			IsValid(plan.TargetConnection)
+				? *GetNameSafe(plan.TargetConnection->GetConnection())
+				: TEXT("<invalid>"),
+			IsValid(plan.TargetConnection) &&
+				plan.TargetConnection->IsConnected()
+				? 1
+				: 0);
+	}
+	return isValid;
+}
+
+void FBlueprintVerticalConveyorConnectionManager::RollBackDirectConnection(
+	FDirectConnectionPlan& plan) const
+{
+	if (plan.CreatedLink && IsValid(plan.BlueprintConnection) &&
+		IsValid(plan.TargetConnection) &&
+		plan.BlueprintConnection->GetConnection() == plan.TargetConnection &&
+		plan.TargetConnection->GetConnection() == plan.BlueprintConnection)
+	{
+		plan.BlueprintConnection->ClearConnection();
+	}
+
+	auto restoreFloorHole = [this](
+		const FEndpointRef& endpoint,
+		UFGFactoryConnectionComponent* expectedCurrent,
+		UFGFactoryConnectionComponent* originalConnection,
+		bool changed)
+	{
+		if (!changed || endpoint.Kind !=
+			EBlueprintVerticalEndpointKind::FloorHoleSide)
 		{
 			return;
 		}
-		if (blueprintConnection->CanConnectTo(targetConnection))
+
+		AFGBuildablePassthrough* floorHole =
+			Cast<AFGBuildablePassthrough>(endpoint.Buildable);
+		if (GetFloorHoleSnappedConnection(floorHole, endpoint.Side) ==
+			expectedCurrent)
 		{
-			blueprintConnection->SetConnection(targetConnection);
+			SetFloorHoleSnappedConnection(
+				floorHole,
+				endpoint.Side,
+				originalConnection);
 		}
-		else if (targetConnection->CanConnectTo(blueprintConnection))
+	};
+	restoreFloorHole(
+		plan.BlueprintEndpoint,
+		plan.TargetConnection,
+		plan.OriginalBlueprintExposedConnection,
+		plan.ChangedBlueprintBookkeeping);
+	restoreFloorHole(
+		plan.TargetEndpoint,
+		plan.BlueprintConnection,
+		plan.OriginalTargetExposedConnection,
+		plan.ChangedTargetBookkeeping);
+
+	if (plan.ChangedBlueprintDirection &&
+		IsValid(plan.BlueprintConnection) &&
+		!plan.BlueprintConnection->IsConnected() &&
+		plan.BlueprintConnection->GetConnection() == nullptr)
+	{
+		plan.BlueprintConnection->SetDirection(plan.OriginalBlueprintDirection);
+	}
+	if (plan.ChangedTargetDirection && IsValid(plan.TargetConnection) &&
+		!plan.TargetConnection->IsConnected() &&
+		plan.TargetConnection->GetConnection() == nullptr)
+	{
+		plan.TargetConnection->SetDirection(plan.OriginalTargetDirection);
+	}
+}
+
+bool FBlueprintVerticalConveyorConnectionManager::ConnectDirectly(
+	const FConnectionState& state) const
+{
+	FDirectConnectionPlan plan;
+	if (!PrepareDirectConnectionPlan(state, plan))
+	{
+		RollBackDirectConnection(plan);
+		return false;
+	}
+
+	if (!plan.WasAlreadyLinked)
+	{
+		if (!ApplyDirectConnectionBookkeeping(plan))
 		{
-			targetConnection->SetConnection(blueprintConnection);
+			RollBackDirectConnection(plan);
+			UE_LOG(
+				LogVerticalConveyorAutoConnect,
+				Warning,
+				TEXT("VerticalConveyorAutoConnect: direct finalization rejected reason=bookkeeping-or-capability-changed source=%s target=%s"),
+				*DescribeEndpoint(plan.BlueprintEndpoint),
+				*DescribeEndpoint(plan.TargetEndpoint));
+			return false;
+		}
+
+		if (plan.BlueprintConnection->CanConnectTo(plan.TargetConnection))
+		{
+			plan.BlueprintConnection->SetConnection(plan.TargetConnection);
+		}
+		else if (plan.TargetConnection->CanConnectTo(plan.BlueprintConnection))
+		{
+			plan.TargetConnection->SetConnection(plan.BlueprintConnection);
 		}
 		else
 		{
-			return;
+			RollBackDirectConnection(plan);
+			return false;
 		}
+		plan.CreatedLink =
+			plan.BlueprintConnection->GetConnection() == plan.TargetConnection &&
+			plan.TargetConnection->GetConnection() == plan.BlueprintConnection;
 	}
 
-	if (blueprintEndpoint.Kind ==
-		EBlueprintVerticalEndpointKind::FloorHoleSide)
+	if (!ValidateDirectConnectionPostCondition(plan))
 	{
-		SetFloorHoleSnappedConnection(
-			Cast<AFGBuildablePassthrough>(blueprintEndpoint.Buildable),
-			blueprintEndpoint.Side,
-			targetConnection);
+		RollBackDirectConnection(plan);
+		return false;
 	}
-	if (targetEndpoint.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide)
-	{
-		SetFloorHoleSnappedConnection(
-			Cast<AFGBuildablePassthrough>(targetEndpoint.Buildable),
-			targetEndpoint.Side,
-			blueprintConnection);
-	}
+
+	UE_LOG(
+		LogVerticalConveyorAutoConnect,
+		Verbose,
+		TEXT("VerticalConveyorAutoConnect: finalized direct connection source=%s sourceConnection=%s target=%s targetConnection=%s alreadyLinked=%d"),
+		*DescribeEndpoint(plan.BlueprintEndpoint),
+		*GetNameSafe(plan.BlueprintConnection),
+		*DescribeEndpoint(plan.TargetEndpoint),
+		*GetNameSafe(plan.TargetConnection),
+		plan.WasAlreadyLinked ? 1 : 0);
+	ScheduleDirectConnectionValidation(plan);
+	return true;
 }
 
 bool FBlueprintVerticalConveyorConnectionManager::
@@ -3218,6 +3769,208 @@ FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
 }
 
 void FBlueprintVerticalConveyorConnectionManager::
+	ScheduleDirectConnectionValidation(
+		const FDirectConnectionPlan& plan) const
+{
+	// As with generated bridges, conveyor tick-group inspection is diagnostic and
+	// can be proportional to factory size. Only run it for verbose logging.
+	if (!UE_LOG_ACTIVE(LogVerticalConveyorAutoConnect, Verbose) ||
+		!IsValid(plan.BlueprintConnection) ||
+		!IsValid(plan.BlueprintConnection->GetWorld()))
+	{
+		return;
+	}
+
+	auto makeEndpointSnapshot = [](
+		const FEndpointRef& endpoint,
+		UFGFactoryConnectionComponent* connection,
+		EFactoryConnectionDirection expectedDirection)
+	{
+		FDirectEndpointValidationSnapshot snapshot;
+		snapshot.Connection = connection;
+		snapshot.ExpectedDirection = expectedDirection;
+		if (endpoint.Kind == EBlueprintVerticalEndpointKind::FloorHoleSide)
+		{
+			snapshot.HadFloorHole = true;
+			snapshot.FloorHole =
+				Cast<AFGBuildablePassthrough>(endpoint.Buildable);
+			snapshot.FloorHoleSide = endpoint.Side;
+		}
+		return snapshot;
+	};
+
+	FDirectValidationSnapshot snapshot;
+	snapshot.Blueprint = makeEndpointSnapshot(
+		plan.BlueprintEndpoint,
+		plan.BlueprintConnection,
+		plan.ExpectedBlueprintDirection);
+	snapshot.Target = makeEndpointSnapshot(
+		plan.TargetEndpoint,
+		plan.TargetConnection,
+		plan.ExpectedTargetDirection);
+
+	plan.BlueprintConnection->GetWorld()->GetTimerManager().SetTimerForNextTick(
+		FTimerDelegate::CreateLambda([snapshot]()
+		{
+			FBlueprintVerticalConveyorConnectionManager::
+				ValidateDirectConnectionNextTick(snapshot);
+		}));
+}
+
+void FBlueprintVerticalConveyorConnectionManager::
+	ValidateDirectConnectionNextTick(FDirectValidationSnapshot snapshot)
+{
+	UFGFactoryConnectionComponent* blueprintConnection =
+		snapshot.Blueprint.Connection.Get();
+	UFGFactoryConnectionComponent* targetConnection =
+		snapshot.Target.Connection.Get();
+
+	auto validateEndpoint = [](
+		const FDirectEndpointValidationSnapshot& endpoint,
+		UFGFactoryConnectionComponent* peer)
+	{
+		UFGFactoryConnectionComponent* connection = endpoint.Connection.Get();
+		if (!IsValid(connection) || !IsValid(peer) ||
+			connection->GetDirection() != endpoint.ExpectedDirection ||
+			connection->GetConnection() != peer || !connection->IsConnected())
+		{
+			return false;
+		}
+
+		if (!endpoint.HadFloorHole)
+		{
+			return true;
+		}
+
+		AFGBuildablePassthrough* floorHole = endpoint.FloorHole.Get();
+		return IsValid(floorHole) &&
+			FBlueprintVerticalConveyorConnectionManager::
+				GetFloorHoleSnappedConnection(
+					floorHole,
+					endpoint.FloorHoleSide) == peer &&
+			FBlueprintVerticalConveyorConnectionManager::
+				GetFloorHoleSnappedConnection(
+					floorHole,
+					FBlueprintVerticalConveyorConnectionManager::OppositeSide(
+						endpoint.FloorHoleSide)) == connection;
+	};
+
+	const bool topologyValid =
+		validateEndpoint(snapshot.Blueprint, targetConnection) &&
+		validateEndpoint(snapshot.Target, blueprintConnection) &&
+		IsValid(blueprintConnection) && IsValid(targetConnection) &&
+		blueprintConnection->GetConnection() == targetConnection &&
+		targetConnection->GetConnection() == blueprintConnection;
+
+	AFGBuildableSubsystem* buildableSubsystem =
+		IsValid(blueprintConnection)
+			? AFGBuildableSubsystem::Get(blueprintConnection->GetOwner())
+			: nullptr;
+	struct FConveyorMembership
+	{
+		AFGBuildableConveyorBase* Conveyor = nullptr;
+		AFGConveyorChainActor* SavedChainActor = nullptr;
+		AFGConveyorChainActor* TickGroupChainActor = nullptr;
+		int32 MatchingTickGroups = 0;
+		bool MatchedGroupIsPending = false;
+		bool IsMismatch = false;
+	};
+
+	auto inspectConveyor = [buildableSubsystem](
+		UFGFactoryConnectionComponent* connection)
+	{
+		FConveyorMembership result;
+		result.Conveyor = IsValid(connection)
+			? Cast<AFGBuildableConveyorBase>(connection->GetOwner())
+			: nullptr;
+		if (!IsValid(result.Conveyor))
+		{
+			return result;
+		}
+
+		result.SavedChainActor = result.Conveyor->GetConveyorChainActor();
+		if (IsValid(buildableSubsystem))
+		{
+			for (FConveyorTickGroup* tickGroup :
+				buildableSubsystem->mConveyorTickGroup)
+			{
+				if (tickGroup == nullptr ||
+					!tickGroup->Conveyors.ContainsByPredicate(
+						[&result](
+							const TObjectPtr<AFGBuildableConveyorBase>& conveyor)
+						{
+							return conveyor.Get() == result.Conveyor;
+						}))
+				{
+					continue;
+				}
+
+				++result.MatchingTickGroups;
+				if (result.MatchingTickGroups == 1)
+				{
+					result.TickGroupChainActor = tickGroup->ChainActor;
+				}
+				result.MatchedGroupIsPending =
+					result.MatchedGroupIsPending ||
+					buildableSubsystem->mConveyorGroupsPendingChainActors.Contains(
+						tickGroup);
+			}
+		}
+
+		result.IsMismatch = result.MatchingTickGroups != 1 ||
+			(!result.MatchedGroupIsPending &&
+			 result.TickGroupChainActor != result.SavedChainActor);
+		return result;
+	};
+
+	const FConveyorMembership blueprintMembership =
+		inspectConveyor(blueprintConnection);
+	const FConveyorMembership targetMembership =
+		inspectConveyor(targetConnection);
+	const bool chainMismatch = blueprintMembership.IsMismatch ||
+		targetMembership.IsMismatch;
+
+	const FString audit = FString::Printf(
+		TEXT("topology=%d source=%s sourceOwner=%s sourceBucket=%d sourceSavedChain=%s sourceTickGroups=%d sourceTickChain=%s sourceTickPending=%d target=%s targetOwner=%s targetBucket=%d targetSavedChain=%s targetTickGroups=%d targetTickChain=%s targetTickPending=%d"),
+		topologyValid ? 1 : 0,
+		*GetNameSafe(blueprintConnection),
+		*GetNameSafe(blueprintMembership.Conveyor),
+		IsValid(blueprintMembership.Conveyor)
+			? blueprintMembership.Conveyor->GetConveyorBucketID()
+			: INDEX_NONE,
+		*GetNameSafe(blueprintMembership.SavedChainActor),
+		blueprintMembership.MatchingTickGroups,
+		*GetNameSafe(blueprintMembership.TickGroupChainActor),
+		blueprintMembership.MatchedGroupIsPending ? 1 : 0,
+		*GetNameSafe(targetConnection),
+		*GetNameSafe(targetMembership.Conveyor),
+		IsValid(targetMembership.Conveyor)
+			? targetMembership.Conveyor->GetConveyorBucketID()
+			: INDEX_NONE,
+		*GetNameSafe(targetMembership.SavedChainActor),
+		targetMembership.MatchingTickGroups,
+		*GetNameSafe(targetMembership.TickGroupChainActor),
+		targetMembership.MatchedGroupIsPending ? 1 : 0);
+
+	if (!topologyValid || chainMismatch)
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: direct post-construct audit failed %s"),
+			*audit);
+	}
+	else
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Verbose,
+			TEXT("VerticalConveyorAutoConnect: direct post-construct audit passed %s"),
+			*audit);
+	}
+}
+
+void FBlueprintVerticalConveyorConnectionManager::
 	SchedulePostConstructValidation(
 		const FBridgeFinalizationPlan& plan,
 		AFGBuildableConveyorLift* lift) const
@@ -3448,7 +4201,15 @@ void FBlueprintVerticalConveyorConnectionManager::Construct(
 
 		if (state.CanDirectlyConnect)
 		{
-			ConnectDirectly(state);
+			if (!ConnectDirectly(state))
+			{
+				UE_LOG(
+					LogVerticalConveyorAutoConnect,
+					Error,
+					TEXT("VerticalConveyorAutoConnect: direct finalization failed source=%s target=%s"),
+					*DescribeEndpoint(GetBlueprintEndpoint(state, true)),
+					*DescribeEndpoint(GetTargetEndpoint(state)));
+			}
 			continue;
 		}
 

@@ -169,6 +169,39 @@ with a specific `bridge preflight rejected` reason. It must not leave a generate
 lift or change either existing continuation. Any `post-construct audit failed`
 line is a regression artifact and should be retained with the save/log.
 
+## Coincident/direct seam hardening
+
+Direct seams are endpoint pairs at the same engine-equal location; they do not
+construct a bridge lift. With `LogVerticalConveyorAutoConnect=Verbose`, every
+successful direct seam must log all three stages:
+
+1. `direct preflight accepted`;
+2. `finalized direct connection`;
+3. `direct post-construct audit passed` on the following tick.
+
+Repeat exact-contact Floor Hole ↔ Floor Hole placement in both transport
+directions, with valid continuation lifts on both sides. Cover all of the
+following:
+
+- an unedited saved blueprint;
+- a blueprint whose seam Floor Hole and continuation were rebuilt before save;
+- a stale saved source continuation mapping (must reject without changing the
+  target or leaving either continuation partially linked);
+- a target claimed or connected after preview lock but before construction
+  (must reject without overwriting that connection);
+- a blueprint-owned attachment port whose runtime direction has not yet been
+  restored by `BeginPlay()`;
+- at least six direct seams finalized by one blueprint placement, followed by
+  immediate save, quit to desktop, reload, and item-flow verification.
+
+Also test a 1 cm vertical offset and other short non-zero spans. They must remain
+on the generated-bridge path; this patch must not widen direct-contact tolerance
+or silently reinterpret nudge offsets as coincident geometry.
+
+Any `direct post-condition failed`, `direct finalization failed`, or
+`direct post-construct audit failed` line is a regression artifact and should be
+retained with the save and log.
+
 ## Diagnostic logging
 
 Normal warnings are always useful in bug reports.
