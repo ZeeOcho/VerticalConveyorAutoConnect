@@ -4,6 +4,16 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Generated bridges and direct seams are re-registered with the buildable
+  subsystem after linking, so they join the conveyor bucket and chain of the
+  side that already existed in the world. Previously the save stored two chain
+  actors on one connected path at each seam, which could crash the next load
+  (#4).
+- The post-construct audits now fail when a seam conveyor's bucket differs from
+  its neighbors'.
+
 ## [1.0.4] - 2026-09-22
 
 ### Fixed
