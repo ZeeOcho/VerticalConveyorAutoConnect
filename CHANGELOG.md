@@ -4,6 +4,8 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-11-09
+
 ### Fixed
 
 - Generated bridges and direct seams are re-registered with the buildable
