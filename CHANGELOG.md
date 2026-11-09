@@ -14,6 +14,15 @@ All notable changes to this project will be documented here.
 - The post-construct audits now fail when a seam conveyor's bucket differs from
   its neighbors'.
 
+### Changed
+
+- Blueprint placement no longer spawns a bridge hologram for every open
+  vertical endpoint; bridges are spawned only for endpoints with a target. This
+  removes a freeze that grew with the number of lifts (several seconds for 32).
+- World endpoints are gathered once per preview update, and a bridge whose
+  inputs have not changed is not reconfigured every frame.
+- Verbose timing lines for initialization, construction and preview updates.
+
 ## [1.0.4] - 2026-09-22
 
 ### Fixed

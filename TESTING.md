@@ -222,6 +222,23 @@ already has continuation lifts, both above and below it. With
    `LogConveyorChain: Warning: Detected conveyor chain tick group belonging to
    multiple different chain actors` line for the seam lifts, and items flow.
 
+## Placement cost
+
+Bridge holograms are spawned only for endpoints that find a target, so a
+blueprint with many open vertical endpoints must not freeze noticeably longer
+than the same blueprint without the mod. With
+`LogVerticalConveyorAutoConnect=Verbose`, place a blueprint with at least 16
+seams and check:
+
+1. `initialized <n> open vertical endpoints in <t> ms` stays near 0 ms;
+2. `construct end bridges=<n> in <t> ms` stays in the tens of milliseconds;
+3. `update timing states=<n> calls=300 avg=<t> ms max=<t> ms` reports an average
+   of a few milliseconds or less while the preview is moved and held still.
+
+Holding the preview still must keep showing the same bridges; moving it by any
+amount must re-evaluate them, and the final placement must still reject a seam
+whose bridge vanilla would not construct.
+
 ## Diagnostic logging
 
 Normal warnings are always useful in bug reports.
