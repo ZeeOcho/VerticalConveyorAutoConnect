@@ -2896,6 +2896,11 @@ bool FBlueprintVerticalConveyorConnectionManager::ConnectDirectly(
 		return false;
 	}
 
+	RegroupLinkedConveyor(
+		Cast<AFGBuildableConveyorBase>(plan.BlueprintConnection->GetOwner()));
+	RegroupLinkedConveyor(
+		Cast<AFGBuildableConveyorBase>(plan.TargetConnection->GetOwner()));
+
 	UE_LOG(
 		LogVerticalConveyorAutoConnect,
 		Verbose,
@@ -3753,6 +3758,7 @@ FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
 	}
 
 	result.Status = EBridgeFinalizationStatus::Succeeded;
+	RegroupLinkedConveyor(lift);
 	UE_LOG(
 		LogVerticalConveyorAutoConnect,
 		Verbose,
@@ -3766,6 +3772,94 @@ FBlueprintVerticalConveyorConnectionManager::FinalizeConstructedBridge(
 
 	SchedulePostConstructValidation(plan, lift);
 	return result;
+}
+
+void FBlueprintVerticalConveyorConnectionManager::RegroupLinkedConveyor(
+	AFGBuildableConveyorBase* conveyor) const
+{
+	// AFGBuildableSubsystem::AddConveyor merges a conveyor's bucket with its
+	// connected neighbors only when it runs. A conveyor that was registered before
+	// it was linked (the generated bridge registers during hologram Construct)
+	// keeps a separate bucket and chain actor from an already registered
+	// neighbor. The save then stores two chain actors on one connected path,
+	// which the next load detects and destroys inside the parallel factory tick.
+	// Re-register it like AFGBuildableSubsystem::SplitConveyorGroupFromAttachment
+	// does: RemoveConveyor, AddConveyor, then mark the bucket groups dirty.
+	if (!IsValid(conveyor) ||
+		conveyor->GetConveyorBucketID() == INDEX_NONE)
+	{
+		return;
+	}
+
+	AFGBuildableSubsystem* buildableSubsystem =
+		AFGBuildableSubsystem::Get(conveyor);
+	if (!IsValid(buildableSubsystem) ||
+		!buildableSubsystem->IsServerSubSystem())
+	{
+		// AddConveyor returns without registering on a non-server subsystem.
+		return;
+	}
+
+	auto getRegisteredNeighbor = [](
+		UFGFactoryConnectionComponent* connection)
+		-> AFGBuildableConveyorBase*
+	{
+		UFGFactoryConnectionComponent* peer =
+			IsValid(connection) ? connection->GetConnection() : nullptr;
+		AFGBuildableConveyorBase* neighbor = IsValid(peer)
+			? Cast<AFGBuildableConveyorBase>(peer->GetOwner())
+			: nullptr;
+		return IsValid(neighbor) &&
+				neighbor->GetConveyorBucketID() != INDEX_NONE
+			? neighbor
+			: nullptr;
+	};
+	auto isSplitFrom = [conveyor](AFGBuildableConveyorBase* neighbor)
+	{
+		return neighbor != nullptr &&
+			neighbor->GetConveyorBucketID() != conveyor->GetConveyorBucketID();
+	};
+
+	AFGBuildableConveyorBase* neighbor0 =
+		getRegisteredNeighbor(conveyor->GetConnection0());
+	AFGBuildableConveyorBase* neighbor1 =
+		getRegisteredNeighbor(conveyor->GetConnection1());
+	if (!isSplitFrom(neighbor0) && !isSplitFrom(neighbor1))
+	{
+		return;
+	}
+
+	const int32 bucketBefore = conveyor->GetConveyorBucketID();
+	buildableSubsystem->RemoveConveyor(conveyor);
+	buildableSubsystem->AddConveyor(conveyor);
+	buildableSubsystem->mConveyorBucketGroupsDirty = true;
+
+	const FString audit = FString::Printf(
+		TEXT("%s bucket=%d->%d neighbor0=%s(%d) neighbor1=%s(%d)"),
+		*GetNameSafe(conveyor),
+		bucketBefore,
+		conveyor->GetConveyorBucketID(),
+		*GetNameSafe(neighbor0),
+		neighbor0 != nullptr ? neighbor0->GetConveyorBucketID() : INDEX_NONE,
+		*GetNameSafe(neighbor1),
+		neighbor1 != nullptr ? neighbor1->GetConveyorBucketID() : INDEX_NONE);
+	if (conveyor->GetConveyorBucketID() == INDEX_NONE ||
+		isSplitFrom(neighbor0) || isSplitFrom(neighbor1))
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Warning,
+			TEXT("VerticalConveyorAutoConnect: regroup left split buckets %s"),
+			*audit);
+	}
+	else
+	{
+		UE_LOG(
+			LogVerticalConveyorAutoConnect,
+			Verbose,
+			TEXT("VerticalConveyorAutoConnect: regrouped %s"),
+			*audit);
+	}
 }
 
 void FBlueprintVerticalConveyorConnectionManager::
@@ -3928,7 +4022,11 @@ void FBlueprintVerticalConveyorConnectionManager::
 	const FConveyorMembership targetMembership =
 		inspectConveyor(targetConnection);
 	const bool chainMismatch = blueprintMembership.IsMismatch ||
-		targetMembership.IsMismatch;
+		targetMembership.IsMismatch ||
+		(IsValid(blueprintMembership.Conveyor) &&
+		 IsValid(targetMembership.Conveyor) &&
+		 blueprintMembership.Conveyor->GetConveyorBucketID() !=
+			targetMembership.Conveyor->GetConveyorBucketID());
 
 	const FString audit = FString::Printf(
 		TEXT("topology=%d source=%s sourceOwner=%s sourceBucket=%d sourceSavedChain=%s sourceTickGroups=%d sourceTickChain=%s sourceTickPending=%d target=%s targetOwner=%s targetBucket=%d targetSavedChain=%s targetTickGroups=%d targetTickChain=%s targetTickPending=%d"),
@@ -4140,6 +4238,13 @@ void FBlueprintVerticalConveyorConnectionManager::
 		getOutsideConveyor(snapshot.Input);
 	AFGBuildableConveyorBase* outputConveyor =
 		getOutsideConveyor(snapshot.Output);
+	auto isSplitFromLift = [lift](AFGBuildableConveyorBase* neighbor)
+	{
+		return IsValid(neighbor) &&
+			neighbor->GetConveyorBucketID() != lift->GetConveyorBucketID();
+	};
+	const bool neighborBucketMismatch =
+		isSplitFromLift(inputConveyor) || isSplitFromLift(outputConveyor);
 
 	const FString audit = FString::Printf(
 		TEXT("lift=%s topology=%d bucket=%d savedChain=%s tickGroups=%d tickChain=%s tickPending=%d inputNeighbor=%s inputBucket=%d inputChain=%s outputNeighbor=%s outputBucket=%d outputChain=%s"),
@@ -4161,7 +4266,7 @@ void FBlueprintVerticalConveyorConnectionManager::
 			? *GetNameSafe(outputConveyor->GetConveyorChainActor())
 			: TEXT("<none>"));
 
-	if (!topologyValid || tickGroupMismatch)
+	if (!topologyValid || tickGroupMismatch || neighborBucketMismatch)
 	{
 		UE_LOG(
 			LogVerticalConveyorAutoConnect,

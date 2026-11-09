@@ -490,6 +490,7 @@ private:
 		FConnectionState& state,
 		FBridgeFinalizationPlan& plan,
 		AFGBuildableConveyorLift* lift) const;
+	void RegroupLinkedConveyor(AFGBuildableConveyorBase* conveyor) const;
 	void SchedulePostConstructValidation(
 		const FBridgeFinalizationPlan& plan,
 		AFGBuildableConveyorLift* lift) const;

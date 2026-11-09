@@ -202,6 +202,26 @@ Any `direct post-condition failed`, `direct finalization failed`, or
 `direct post-construct audit failed` line is a regression artifact and should be
 retained with the save and log.
 
+## Conveyor chain grouping (issue #4)
+
+A generated bridge or direct seam must end up in the same conveyor bucket and
+chain actor as the conveyors on both sides of it, including the side that was
+already in the world before the placement. Otherwise the save stores two chain
+actors on one connected path, and the next load can crash in the factory tick.
+
+Place a blueprint with at least six seams onto an existing structure that
+already has continuation lifts, both above and below it. With
+`LogVerticalConveyorAutoConnect=Verbose`:
+
+1. every bridge or direct seam whose neighbor sits in another bucket logs
+   `regrouped <conveyor> bucket=<old>-><new>`, and no
+   `regroup left split buckets` warning appears;
+2. every `post-construct audit passed` line shows the same value for `bucket`,
+   `inputBucket` and `outputBucket` (a mismatch now fails the audit);
+3. after save, quit to desktop and reload, the log has no
+   `LogConveyorChain: Warning: Detected conveyor chain tick group belonging to
+   multiple different chain actors` line for the seam lifts, and items flow.
+
 ## Diagnostic logging
 
 Normal warnings are always useful in bug reports.
