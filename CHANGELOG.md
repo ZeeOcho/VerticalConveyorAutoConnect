@@ -4,6 +4,19 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-11-21
+
+### Fixed
+
+- Rebuilt against the game headers for build CL520140 (SML 3.12.1). Under that
+  build, 1.0.5 read conveyor lift connections and attachment directions from
+  outdated memory offsets, so it rejected every bridge it had previewed and
+  built none. No source changes; saves and blueprints carry over unchanged.
+
+### Changed
+
+- Requires game build CL520140 or later and SML 3.12.1 or later.
+
 ## [1.0.5] - 2026-11-09
 
 ### Fixed
