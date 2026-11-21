@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "1.0.5",
-	"SemVersion": "1.0.5",
-	"GameVersion": ">=502094",
+	"VersionName": "1.0.6",
+	"SemVersion": "1.0.6",
+	"GameVersion": ">=520140",
 	"FriendlyName": "Vertical Conveyor Auto-Connect",
 	"Description": "Automatically connects compatible aligned vertical conveyor endpoints across blueprint boundaries with vanilla Conveyor Lifts.",
 	"Category": "Modding",
@@ -27,7 +27,7 @@
 		{
 			"Name": "SML",
 			"Enabled": true,
-			"SemVersion": "^3.12.0"
+			"SemVersion": "^3.12.1"
 		}
 	]
 }
